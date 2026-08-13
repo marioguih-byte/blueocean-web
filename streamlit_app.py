@@ -1022,10 +1022,22 @@ window.blueoceanAbrirPrevisao = function(estacaoKey) {
         _blueoceanDebug("🔎 clique recebido: " + estacaoKey);
         var topoDoc = window.top.document;
         var alvo = null;
-        topoDoc.querySelectorAll('input[type="text"]').forEach(function(inp) {
-            if (inp.getAttribute("aria-label") === "bridge_unidade_previsao") alvo = inp;
-        });
-        if (!alvo) { _blueoceanDebug("❌ campo-ponte não encontrado"); return; }
+
+        // Estratégia principal: acha pela classe do container que a gente
+        // mesmo cria (não depende de como o Streamlit nomeia aria-label,
+        // que pode mudar entre versões).
+        var container = topoDoc.querySelector(".st-key-ponte_previsao");
+        if (container) alvo = container.querySelector("input");
+
+        // Fallback: procura por aria-label, caso a classe do container
+        // não seja encontrada por algum motivo.
+        if (!alvo) {
+            topoDoc.querySelectorAll('input[type="text"]').forEach(function(inp) {
+                if (inp.getAttribute("aria-label") === "bridge_unidade_previsao") alvo = inp;
+            });
+        }
+
+        if (!alvo) { _blueoceanDebug("❌ campo-ponte não encontrado (container=" + !!container + ")"); return; }
 
         alvo.focus();
         alvo.select();
