@@ -10,7 +10,6 @@ import re
 import shutil
 import time
 import unicodedata
-import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -48,7 +47,7 @@ if os.path.exists(_som_origem) and not os.path.exists(_som_destino):
 RAIOS_JSON_PATH = os.path.join(STATIC_DIR, "raios_live.json")
 
 
-def _escrever_raios_json(raios_df, celulas_com_trajetoria, atualizado_em_utc, erro=None):
+def _escrever_raios_json(raios_df, celulas_com_trajetoria, atualizado_em_utc, alertas_unidade=None, erro=None):
     """Grava o estado atual dos raios num JSON estático que o JS do mapa
     fica lendo periodicamente. É isso que permite atualizar só os raios
     sem re-renderizar o mapa (e sem perder zoom / popups abertos)."""
@@ -72,9 +71,19 @@ def _escrever_raios_json(raios_df, celulas_com_trajetoria, atualizado_em_utc, er
             "vel_kmh": round(traj["vel_kmh"], 1),
             "rumo_texto": traj["rumo_texto"],
         })
+    alertas_out = []
+    for nome, a in (alertas_unidade or {}).items():
+        if a["expira_ts"] <= time.time(): continue
+        alertas_out.append({
+            "estacao": nome,
+            "nivel": a["nivel"],
+            "notificado_ts": a["notificado_ts"],
+            "expira_brasilia": utc_para_brasilia(datetime.fromtimestamp(a["expira_ts"], tz=timezone.utc)).strftime("%H:%M:%S"),
+        })
     payload = {
         "raios": raios_out,
         "celulas": celulas_out,
+        "alertas": alertas_out,
         "atualizado_em_utc": atualizado_em_utc.isoformat() if atualizado_em_utc else None,
         "atualizado_em_brasilia": utc_para_brasilia(atualizado_em_utc).strftime("%H:%M:%S") if atualizado_em_utc else None,
         "erro": erro,
@@ -256,13 +265,17 @@ def montar_mensagem_alerta_cape(nome, periodos_texto, cape_max):
             f"ao vivo (GLM/GOES-19) pra confirmação. As condições seguem em monitoramento contínuo pela "
             f"Blue Ocean Meteorologia.")
 
-def montar_mensagem_proximidade_raio(nivel, nome_estacao, meteorologista):
+def montar_mensagem_proximidade_raio(nivel_km, nome_estacao, meteorologista, renovacao=False):
     agora = utc_para_brasilia(datetime.now(timezone.utc))
     validade = agora + timedelta(hours=1)
-    janela = "-15 min até o momento" if nivel == 30 else "-30 min até o momento"
-    emoji = "🔴" if nivel == 30 else "🟡"
+    janela = "-15 min até o momento" if nivel_km == 30 else "-30 min até o momento"
+    emoji = "🔴" if nivel_km == 30 else "🟡"
+    nivel_nome = "VERMELHO (raio a menos de 30 km)" if nivel_km == 30 else "AMARELO (raio a menos de 50 km)"
+    prefixo = "🔁 Alerta renovado após 1h — segue ativo" if renovacao else "Novo alerta"
     return (f"{emoji} {agora.strftime('%d/%m/%Y')} - {agora.strftime('%H:%M')}\n"
+            f"* {prefixo}\n"
             f"* Local: {nome_estacao}\n"
+            f"* Nível de alerta: {nivel_nome}\n"
             f"* Meteorologista: {meteorologista or '(não informado)'}\n"
             f"* Raios próximos de sua região ({janela})\n"
             f"Válido até as {validade.strftime('%H:%M')}")
@@ -670,7 +683,7 @@ st.title("🌬️ BlueOcean — Rajadas de Vento, Precipitação e CAPE")
 st.caption("Versão web do painel de monitoramento — by Mário Henrique")
 
 if "alertas_raio_ativos" not in st.session_state: st.session_state.alertas_raio_ativos = []
-if "alertas_raio_disparados" not in st.session_state: st.session_state.alertas_raio_disparados = {}
+if "alertas_unidade" not in st.session_state: st.session_state.alertas_unidade = {}
 if "log_alertas" not in st.session_state: st.session_state.log_alertas = []
 
 with st.sidebar:
@@ -771,6 +784,19 @@ var_map = {"Rajada de vento": ("max_gust", gust_color_hex, "km/h"), "Precipitaç
 chave_var, color_fn, unidade_var = var_map[variavel_mapa]
 chave_dado_hora = {"Rajada de vento": "gusts", "Precipitação": "precip", "CAPE": "capes"}[variavel_mapa]
 
+# --------------------------------------------------------------
+# "Ponte" escondida: o JS do mapa preenche esse campo (via DOM,
+# sem navegação — o iframe do componente não tem permissão pra
+# navegar a página principal) quando alguém clica em "Ver previsão
+# horária" no pop-up de uma unidade. O Streamlit então reage a essa
+# mudança normalmente, como qualquer outro widget.
+# --------------------------------------------------------------
+st.markdown("<style>.st-key-ponte_previsao { display: none; }</style>", unsafe_allow_html=True)
+if st.session_state.pop("_limpar_previsao_flag", False):
+    st.session_state["bridge_unidade_previsao"] = ""
+with st.container(key="ponte_previsao"):
+    st.text_input("bridge_unidade_previsao", key="bridge_unidade_previsao", label_visibility="collapsed")
+
 @st.dialog("⚡ Raio próximo de uma unidade!")
 def _dialog_alerta_raio():
     texto = st.session_state.get("dialog_raio_texto")
@@ -806,24 +832,41 @@ def _atualizar_dados_raios():
                 if traj is not None: celulas_com_trajetoria.append({**cel, "trajetoria": traj})
 
         if not raios_df.empty:
-            for _, raio in raios_df.iterrows():
-                for _, est in df_estacoes.iterrows():
-                    dist = ((raio["lat"] - est["lat"]) ** 2 + (raio["lon"] - est["lon"]) ** 2) ** 0.5 * 111
-                    for nivel in (30, 50):
-                        if dist > nivel: continue
-                        chave_alerta = f"{est['nome']}_{nivel}"
-                        ultimo = st.session_state.alertas_raio_disparados.get(chave_alerta, 0)
-                        if time.time() - ultimo < 3600: continue
-                        st.session_state.alertas_raio_disparados[chave_alerta] = time.time()
-                        texto = montar_mensagem_proximidade_raio(nivel, est["nome"], params["meteorologista"])
-                        st.session_state.alertas_raio_ativos.insert(0, {"texto": texto, "estacao": est["nome"], "expira": time.time() + 3600})
-                        st.session_state.dialog_raio_texto = texto
+            for _, est in df_estacoes.iterrows():
+                # menor distância até qualquer raio ativo no momento
+                dists = ((raios_df["lat"] - est["lat"]) ** 2 + (raios_df["lon"] - est["lon"]) ** 2) ** 0.5 * 111
+                dist_min = float(dists.min())
+
+                if dist_min <= 30: nivel_atual, nivel_km = "vermelho", 30
+                elif dist_min <= 50: nivel_atual, nivel_km = "amarelo", 50
+                else: nivel_atual, nivel_km = None, None
+                if nivel_atual is None: continue
+
+                agora_ts = time.time()
+                existente = st.session_state.alertas_unidade.get(est["nome"])
+                deve_notificar, renovacao = False, False
+                if existente is None:
+                    deve_notificar = True
+                elif nivel_atual == "vermelho" and existente["nivel"] == "amarelo":
+                    # escalou de amarelo pra vermelho: avisa de novo, mais grave
+                    deve_notificar = True
+                elif agora_ts >= existente["expira_ts"]:
+                    # já passou 1h e o perigo continua: renotifica
+                    deve_notificar, renovacao = True, True
+
+                if deve_notificar:
+                    st.session_state.alertas_unidade[est["nome"]] = {
+                        "nivel": nivel_atual, "notificado_ts": agora_ts, "expira_ts": agora_ts + 3600,
+                    }
+                    texto = montar_mensagem_proximidade_raio(nivel_km, est["nome"], params["meteorologista"], renovacao=renovacao)
+                    st.session_state.alertas_raio_ativos.insert(0, {"texto": texto, "estacao": est["nome"], "expira": agora_ts + 3600})
+                    st.session_state.dialog_raio_texto = texto
 
     st.session_state.alertas_raio_ativos = [a for a in st.session_state.alertas_raio_ativos if a["expira"] > time.time()]
     st.session_state["_fragment_raios_df"] = raios_df
     st.session_state["_fragment_celulas"] = celulas_com_trajetoria
 
-    _escrever_raios_json(raios_df, celulas_com_trajetoria, st.session_state.get("ultima_atualizacao_raios"), erro)
+    _escrever_raios_json(raios_df, celulas_com_trajetoria, st.session_state.get("ultima_atualizacao_raios"), st.session_state.alertas_unidade, erro)
 
     if st.session_state.get("dialog_raio_texto"): _dialog_alerta_raio()
 
@@ -866,12 +909,12 @@ def _construir_mapa():
 
         popup_html = (f"<b>{e['risco_emoji']} {e['nome']}</b><br/>Risco combinado: <b style='color:{e['risco_color']}'>{e['risco_label']}</b><br/>{variavel_mapa} {'às ' + hora_especifica + ':00' if hora_especifica else '(resumo do dia)'}: <b>{texto_valor}</b><br/><hr/>Rajada máx. do dia: {e['max_gust']:.0f} km/h<br/>Chuva acum. do dia: {e['soma_precip']:.1f} mm<br/>CAPE máx. do dia: {e['max_cape']:.0f} J/kg")
 
-        estacao_url = urllib.parse.quote(e["estacao"])
+        estacao_js_str = json.dumps(e["estacao"]).replace('"', "&quot;")
         popup_html += (
-            f"<br/><a href='?unidade_previsao={estacao_url}' target='_top' "
+            f"<br/><button onclick='window.blueoceanAbrirPrevisao({estacao_js_str})' "
             "style='display:inline-block; margin-top:6px; padding:4px 10px; background:#2563eb; "
-            "color:#fff; border-radius:5px; text-decoration:none; font-size:12px;'>"
-            "📈 Ver previsão horária completa</a>"
+            "color:#fff; border:none; border-radius:5px; cursor:pointer; font-size:12px;'>"
+            "📈 Ver previsão horária completa</button>"
         )
 
         if e["contatos"]:
@@ -980,6 +1023,26 @@ window.addEventListener("load", function() {
         });
     } catch (e) {}
 });
+
+// Ponte pra abrir a previsão horária de uma unidade na aba lateral,
+// sem navegar (o iframe não tem permissão pra navegar a página
+// principal) — em vez disso, escreve direto no campo de texto
+// escondido "bridge_unidade_previsao" e dispara os eventos que o
+// Streamlit espera pra reconhecer a mudança e rodar de novo.
+window.blueoceanAbrirPrevisao = function(estacaoKey) {
+    try {
+        var parentDoc = window.parent.document;
+        var alvo = null;
+        parentDoc.querySelectorAll('input[type="text"]').forEach(function(inp) {
+            if (inp.getAttribute("aria-label") === "bridge_unidade_previsao") alvo = inp;
+        });
+        if (!alvo) return;
+        var setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, "value").set;
+        setter.call(alvo, estacaoKey);
+        alvo.dispatchEvent(new window.parent.Event("input", { bubbles: true }));
+        alvo.blur();
+    } catch (e) {}
+};
 </script>
 """
     m.get_root().html.add_child(folium.Element(retrair_html))
@@ -1000,8 +1063,6 @@ window.addEventListener("load", function() {
             "janelaMin": raios_minutos,
             "somUrl": f"app/static/{SOM_ALERTA_NOME}",
             "jsonUrl": "app/static/raios_live.json",
-            "niveisPerigoKm": [30, 50],
-            "cooldownMs": 3600 * 1000,
             "mostrarDeslocamento": bool(mostrar_deslocamento),
             "tocarSom": bool(tocar_som),
         }
@@ -1011,6 +1072,7 @@ window.addEventListener("load", function() {
   ⚡ carregando raios…
   <button id="raios-som-btn" style="margin-left:8px; font:11px sans-serif; cursor:pointer; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:4px; padding:1px 6px;">🔊 ativar som</button>
 </div>
+<div id="alertas-unidade-box" style="display:none; position:absolute; z-index:1000; top:44px; left:50px; max-width:260px;"></div>
 <style>
 .raio-celula-icon {{ background: transparent !important; border: none !important; }}
 </style>
@@ -1025,17 +1087,14 @@ window.addEventListener("load", function() {{
     var audio = new Audio(cfg.somUrl);
     audio.preload = "auto";
     var somLiberado = false;
-    var ultimoAlerta = {{}};
+    var vistosNotificacao = {{}};
     var statusEl = document.getElementById("raios-status-bar");
+    var alertasBox = document.getElementById("alertas-unidade-box");
     var btnSom = document.getElementById("raios-som-btn");
     if (btnSom) {{
         btnSom.onclick = function() {{
             audio.play().then(function() {{ audio.pause(); audio.currentTime = 0; somLiberado = true; btnSom.innerText = "🔊 som ativado"; }}).catch(function() {{}});
         }};
-    }}
-
-    function distKm(lat1, lon1, lat2, lon2) {{
-        return Math.sqrt(Math.pow(lat1 - lat2, 2) + Math.pow(lon1 - lon2, 2)) * 111;
     }}
 
     function corPorIdade(idadeMin) {{
@@ -1045,28 +1104,43 @@ window.addEventListener("load", function() {{
         return "#eab308";
     }}
 
-    function checarPerigo(raios) {{
-        if (!cfg.tocarSom) return;
-        var agora = Date.now();
-        raios.forEach(function(r) {{
-            cfg.estacoes.forEach(function(est) {{
-                var d = distKm(r.lat, r.lon, est.lat, est.lon);
-                cfg.niveisPerigoKm.forEach(function(nivel) {{
-                    if (d > nivel) return;
-                    var chave = est.nome + "_" + nivel;
-                    if (ultimoAlerta[chave] && (agora - ultimoAlerta[chave]) < cfg.cooldownMs) return;
-                    ultimoAlerta[chave] = agora;
-                    var nomeVar = cfg.marcadores[est.nome];
-                    var marcador = nomeVar ? window[nomeVar] : null;
-                    if (marcador && marcador.openPopup) {{
-                        marcador.openPopup();
-                        if (map.setView) map.panTo(marcador.getLatLng());
-                    }}
-                    audio.currentTime = 0;
-                    audio.play().catch(function() {{}});
-                }});
-            }});
+    function checarPerigo(alertas) {{
+        // O Python já calculou distância, nível (vermelho <=30km / amarelo
+        // <=50km) e a janela de 1h — aqui só decide se é uma notificação
+        // NOVA (primeira vez ou renovada após 1h) usando notificado_ts,
+        // pra não repetir som/pop-up toda vez que o mapa é reconstruído.
+        (alertas || []).forEach(function(a) {{
+            var jaVisto = vistosNotificacao[a.estacao];
+            var ehNova = jaVisto === undefined || jaVisto !== a.notificado_ts;
+            vistosNotificacao[a.estacao] = a.notificado_ts;
+            if (!ehNova) return;
+
+            if (cfg.tocarSom) {{
+                var nomeVar = cfg.marcadores[a.estacao];
+                var marcador = nomeVar ? window[nomeVar] : null;
+                if (marcador && marcador.openPopup) {{
+                    marcador.openPopup();
+                    if (map.panTo) map.panTo(marcador.getLatLng());
+                }}
+                audio.currentTime = 0;
+                audio.play().catch(function() {{}});
+            }}
         }});
+    }}
+
+    function desenharAlertas(alertas) {{
+        if (!alertasBox) return;
+        if (!alertas || !alertas.length) {{ alertasBox.innerHTML = ""; alertasBox.style.display = "none"; return; }}
+        alertasBox.style.display = "block";
+        var ordem = {{"vermelho": 0, "amarelo": 1}};
+        var lista = alertas.slice().sort(function(a, b) {{ return (ordem[a.nivel] ?? 2) - (ordem[b.nivel] ?? 2); }});
+        alertasBox.innerHTML = lista.map(function(a) {{
+            var cor = a.nivel === "vermelho" ? "#ef4444" : "#eab308";
+            var textoCor = a.nivel === "vermelho" ? "#fff" : "#111827";
+            var rotulo = a.nivel === "vermelho" ? "🔴 VERMELHO · raio a <30km" : "🟡 AMARELO · raio a <50km";
+            return '<div style="background:' + cor + '; color:' + textoCor + '; padding:4px 8px; border-radius:5px; margin-bottom:4px; font:11px sans-serif;">' +
+                '<b>' + a.estacao + '</b><br/>' + rotulo + ' · ativo até ' + a.expira_brasilia + '</div>';
+        }}).join("");
     }}
 
     function desenharRaios(data) {{
@@ -1114,7 +1188,8 @@ window.addEventListener("load", function() {{
             .then(function(r) {{ return r.json(); }})
             .then(function(data) {{
                 desenharRaios(data);
-                checarPerigo(data.raios || []);
+                desenharAlertas(data.alertas || []);
+                checarPerigo(data.alertas || []);
                 if (statusEl) {{
                     var txt = data.erro ? ("⚠️ GLM indisponível: " + data.erro) : ("⚡ raios atualizados às " + (data.atualizado_em_brasilia || "—"));
                     statusEl.childNodes[0].nodeValue = txt + " ";
@@ -1147,12 +1222,12 @@ with col_mapa:
 with col_lado:
     with st.container(key="painel_lateral"):
         unidade_focada = None
-        unidade_clicada_nome = st.query_params.get("unidade_previsao")
+        unidade_clicada_nome = st.session_state.get("bridge_unidade_previsao", "")
         if unidade_clicada_nome:
             linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_clicada_nome]
             if not linhas_foco.empty: unidade_focada = linhas_foco.iloc[0]
 
-        tab_horaria, tab_risco, tab_rank, tab_alertas, tab_raio, tab_contatos = st.tabs(["📈 Horária", "🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📞 Contatos"])
+        tab_horaria, tab_risco, tab_rank, tab_alertas, tab_raio = st.tabs(["📈 Horária", "🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios"])
 
         with tab_horaria:
             if unidade_focada is None:
@@ -1160,7 +1235,7 @@ with col_lado:
             else:
                 st.markdown(f"**📈 Previsão horária — {unidade_focada['nome']}**")
                 if st.button("✕ limpar seleção", key="limpar_unidade_previsao"):
-                    if "unidade_previsao" in st.query_params: del st.query_params["unidade_previsao"]
+                    st.session_state["_limpar_previsao_flag"] = True
                     st.rerun()
                 horas_full = [f"{h:02d}:00" for h in range(24)]
                 tabela_horaria = pd.DataFrame({"hora": horas_full}).set_index("hora")
@@ -1228,16 +1303,6 @@ with col_lado:
                         st.code(a["texto"], language=None)
             else:
                 st.info("Nenhum alerta de raio próximo ativo.")
-
-        with tab_contatos:
-            nomes_unidades = sorted(CONTATOS_UNIDADES.keys(), key=lambda k: CONTATOS_UNIDADES[k]["nome"].lower())
-            escolha = st.selectbox("Unidade", nomes_unidades, format_func=lambda k: CONTATOS_UNIDADES[k]["nome"])
-            info = CONTATOS_UNIDADES[escolha]
-            st.markdown(f"**📞 {info['nome']}**")
-            for i, item in enumerate(info["numeros"], start=1):
-                linha = f"{i}. {item['numero']}"
-                if item.get("descricao"): linha += f"  _{item['descricao']}_"
-                st.markdown(linha)
 
 st.divider()
 col_pdf, _ = st.columns([1, 3])
