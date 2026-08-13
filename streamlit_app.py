@@ -1009,20 +1009,46 @@ window.addEventListener("load", function() {{
     # não importa quantos iframes existam no meio.
     # --------------------------------------------------------------
     ponte_html = """
+<div id="ponte-debug-bar" style="display:none; position:absolute; z-index:1000; top:8px; left:50%; transform:translateX(-50%); background:rgba(15,15,20,0.85); color:#e5e7eb; padding:4px 10px; border-radius:6px; font:11px monospace;"></div>
 <script>
+function _blueoceanDebug(msg) {
+    try {
+        var el = document.getElementById("ponte-debug-bar");
+        if (el) { el.style.display = "block"; el.innerText = msg; setTimeout(function(){ el.style.display = "none"; }, 4000); }
+    } catch (e) {}
+}
 window.blueoceanAbrirPrevisao = function(estacaoKey) {
     try {
+        _blueoceanDebug("🔎 clique recebido: " + estacaoKey);
         var topoDoc = window.top.document;
         var alvo = null;
         topoDoc.querySelectorAll('input[type="text"]').forEach(function(inp) {
             if (inp.getAttribute("aria-label") === "bridge_unidade_previsao") alvo = inp;
         });
-        if (!alvo) return;
+        if (!alvo) { _blueoceanDebug("❌ campo-ponte não encontrado"); return; }
+
         alvo.focus();
         alvo.select();
-        topoDoc.execCommand("insertText", false, estacaoKey);
+
+        // Tenta várias formas de "digitar" no campo, porque diferentes
+        // navegadores/versões reagem diferente ao componente React do
+        // Streamlit. Fazer todas não tem problema — são idempotentes.
+        var execOk = false;
+        try { execOk = topoDoc.execCommand("insertText", false, estacaoKey); } catch (e) {}
+
+        try {
+            var setter = Object.getOwnPropertyDescriptor(window.top.HTMLInputElement.prototype, "value").set;
+            setter.call(alvo, estacaoKey);
+            alvo.dispatchEvent(new window.top.Event("input", { bubbles: true }));
+        } catch (e) {}
+
+        try { alvo.dispatchEvent(new window.top.Event("change", { bubbles: true })); } catch (e) {}
+
         alvo.blur();
-    } catch (e) {}
+        _blueoceanDebug("✅ enviado (valor final: " + alvo.value + ")");
+    } catch (e) {
+        _blueoceanDebug("⚠️ erro: " + String(e));
+    }
 };
 </script>
 """
