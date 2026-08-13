@@ -391,16 +391,36 @@ ENSEMBLE_MODELOS = ["gfs_seamless", "icon_seamless", "ecmwf_ifs025"]
 
 def build_session():
     s = requests.Session()
-    retries = Retry(total=4, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
+    # total mais alto e backoff maior: a Open-Meteo às vezes devolve 429
+    # (limite de requisições) pro IP compartilhado dos servidores gratuitos
+    # do Streamlit Cloud — vale insistir mais tempo em vez de desistir rápido.
+    retries = Retry(total=8, backoff_factor=4, status_forcelist=[429, 500, 502, 503, 504],
+                     allowed_methods=["GET"], respect_retry_after_header=True)
     a = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
     s.mount("https://", a); s.mount("http://", a)
+    s.headers.update({"User-Agent": "BlueOceanApp/1.0 (uso pessoal/operacional - contato via Streamlit)"})
     return s
+
+
+def _openmeteo_base_url():
+    """Se uma chave de API gratuita da Open-Meteo estiver configurada nos
+    'Secrets' do Streamlit Cloud, usa o endpoint dedicado (fila própria,
+    menos sujeito a 429 por IP compartilhado). Sem chave, usa o endpoint
+    público padrão normalmente."""
+    try:
+        chave = st.secrets.get("OPENMETEO_API_KEY", None)
+    except Exception:
+        chave = None
+    if chave:
+        return "https://customer-api.open-meteo.com/v1/forecast", chave
+    return "https://api.open-meteo.com/v1/forecast", None
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def fetch_openmeteo_full_hourly(df_json, model, target_date, batch_size=40):
     df = pd.read_json(io.StringIO(df_json))
     session = build_session()
+    url, api_key = _openmeteo_base_url()
     today = pd.Timestamp.now("UTC").tz_localize(None).normalize()
     target = pd.Timestamp(target_date).normalize()
     diff_days = (today - target).days
@@ -422,7 +442,9 @@ def fetch_openmeteo_full_hourly(df_json, model, target_date, batch_size=40):
             "hourly": "wind_gusts_10m,wind_speed_10m,wind_direction_10m,precipitation,cape",
             "models": model, "timezone": "UTC", "past_days": past_days, "forecast_days": forecast_days,
         }
-        r = session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=90)
+        if api_key:
+            params["apikey"] = api_key
+        r = session.get(url, params=params, timeout=90)
         r.raise_for_status()
         data = r.json()
         points = data if isinstance(data, list) else [data]
@@ -436,6 +458,7 @@ def fetch_openmeteo_full_hourly(df_json, model, target_date, batch_size=40):
                 results.append({"estacao": row["estacao"], "lat": row["lat"], "lon": row["lon"], "modelo": model,
                                  "valid_time": t, "wind_gust_kmh": g, "wind_speed_kmh": s_, "wind_dir_deg": dr,
                                  "precip_mm": p, "cape_jkg": cp})
+        time.sleep(1.0)  # pausa entre lotes pra não estourar o limite de requisições da API
     out = pd.DataFrame(results)
     out["valid_time"] = pd.to_datetime(out["valid_time"])
     return out
@@ -743,7 +766,11 @@ if gerar:
     with st.spinner("Buscando dados no Open-Meteo..."):
         modelos_necessarios = set(ENSEMBLE_MODELOS) | {m for m in (modelo_vento, modelo_chuva, modelo_cape) if m != "ensemble"}
         df_json = df_stations.to_json()
-        dfs_base = {m: fetch_openmeteo_full_hourly(df_json, m, str(target_date)) for m in sorted(modelos_necessarios)}
+        dfs_base = {}
+        for i, m in enumerate(sorted(modelos_necessarios)):
+            if i > 0:
+                time.sleep(2.0)  # espaça a busca de cada modelo pra não somar tudo de uma vez
+            dfs_base[m] = fetch_openmeteo_full_hourly(df_json, m, str(target_date))
 
         def obter(modelo_id):
             return compute_ensemble([dfs_base[m] for m in ENSEMBLE_MODELOS]) if modelo_id == "ensemble" else dfs_base[modelo_id]
