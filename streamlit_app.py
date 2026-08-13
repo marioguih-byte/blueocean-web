@@ -930,6 +930,9 @@ def _construir_mapa():
   ⚡ carregando raios…
   <button id="raios-som-btn" style="margin-left:8px; font:11px sans-serif; cursor:pointer; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:4px; padding:1px 6px;">🔊 ativar som</button>
 </div>
+<style>
+.raio-celula-icon {{ background: transparent !important; border: none !important; }}
+</style>
 <script>
 // "load" garante que isso só roda DEPOIS do script principal do Folium
 // (que cria o mapa e os marcadores), não importa a ordem no HTML.
@@ -1007,6 +1010,7 @@ window.addEventListener("load", function() {{
                     var atual = (i === hist.length - 1);
                     var tam = atual ? 18 : 13;
                     var icone = L.divIcon({{
+                        className: "raio-celula-icon",
                         html: '<div style="font-weight:900; font-size:' + tam + 'px; color:' + (atual ? "#ef4444" : "#eab308") + '; text-shadow:0 0 4px #000,0 0 7px #000; line-height:1;">✕</div>',
                         iconSize: [tam + 6, tam + 6], iconAnchor: [(tam + 6) / 2, (tam + 6) / 2]
                     }});
@@ -1112,11 +1116,6 @@ with col_lado:
         if incluir_raios:
             ultima_att = st.session_state.get("ultima_atualizacao_raios")
             if ultima_att is not None: st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')} (Brasília)** · janela de {raios_minutos} min · atualiza a cada {intervalo_raios_seg}s")
-            if celulas_com_trajetoria:
-                st.markdown(f"**{len(celulas_com_trajetoria)} célula(s) de tempestade em deslocamento:**")
-                for cel in celulas_com_trajetoria:
-                    traj = cel["trajetoria"]
-                    st.caption(f"🌀 Célula #{cel['id']} — {cel['historico'][-1]['n']} raios · ~{traj['vel_kmh']:.0f} km/h para {traj['rumo_texto']}")
         else: st.caption("Raios desativados na barra lateral.")
         
         if st.session_state.alertas_raio_ativos:
