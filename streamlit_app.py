@@ -5,7 +5,9 @@
 import io
 import json
 import math
+import os
 import re
+import shutil
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -17,13 +19,70 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from requests.adapters import HTTPAdapter
-from streamlit_folium import st_folium
 from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="BlueOcean — Rajadas de Vento", layout="wide", page_icon="🌬️")
 
 EMPRESA = "BlueOcean"
+
+# ======================================================================
+# ARQUIVOS ESTÁTICOS (necessário pro mapa ler os raios via JS sem
+# precisar recarregar a página inteira — ver seção "RAIOS AO VIVO")
+# ======================================================================
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(APP_DIR, "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+SOM_ALERTA_NOME = "alerta_raio.wav"
+_som_origem = os.path.join(APP_DIR, "data", SOM_ALERTA_NOME)
+_som_destino = os.path.join(STATIC_DIR, SOM_ALERTA_NOME)
+if os.path.exists(_som_origem) and not os.path.exists(_som_destino):
+    try:
+        shutil.copyfile(_som_origem, _som_destino)
+    except Exception:
+        pass
+
+RAIOS_JSON_PATH = os.path.join(STATIC_DIR, "raios_live.json")
+
+
+def _escrever_raios_json(raios_df, celulas_com_trajetoria, atualizado_em_utc, erro=None):
+    """Grava o estado atual dos raios num JSON estático que o JS do mapa
+    fica lendo periodicamente. É isso que permite atualizar só os raios
+    sem re-renderizar o mapa (e sem perder zoom / popups abertos)."""
+    agora = datetime.now(timezone.utc)
+    raios_out = []
+    if raios_df is not None and not raios_df.empty:
+        for _, r in raios_df.iterrows():
+            idade_min = max((agora - r["time"]).total_seconds() / 60, 0) if pd.notna(r["time"]) else 0
+            raios_out.append({
+                "lat": float(r["lat"]), "lon": float(r["lon"]),
+                "idade_min": round(idade_min, 1),
+                "hora": utc_para_brasilia(r["time"]).strftime("%H:%M:%S") if pd.notna(r["time"]) else "?",
+            })
+    celulas_out = []
+    for cel in celulas_com_trajetoria:
+        traj = cel["trajetoria"]
+        celulas_out.append({
+            "id": cel["id"],
+            "historico": [{"lat": p["lat"], "lon": p["lon"]} for p in cel["historico"]],
+            "checkpoints": traj["checkpoints"],
+            "vel_kmh": round(traj["vel_kmh"], 1),
+            "rumo_texto": traj["rumo_texto"],
+        })
+    payload = {
+        "raios": raios_out,
+        "celulas": celulas_out,
+        "atualizado_em_utc": atualizado_em_utc.isoformat() if atualizado_em_utc else None,
+        "atualizado_em_brasilia": utc_para_brasilia(atualizado_em_utc).strftime("%H:%M:%S") if atualizado_em_utc else None,
+        "erro": erro,
+    }
+    try:
+        with open(RAIOS_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 # ======================================================================
 # CONTATOS POR UNIDADE
@@ -647,9 +706,10 @@ with st.sidebar:
     st.subheader("⚡ Raios ao vivo (GLM/GOES-19)")
     incluir_raios = st.checkbox("Mostrar raios ao vivo no mapa", value=True)
     raios_minutos = st.slider("Janela de tempo (min)", 5, 60, 15, step=5, disabled=not incluir_raios)
-    tocar_som = st.checkbox("Tocar som quando raio cair perto de uma unidade", value=True, disabled=not incluir_raios)
+    intervalo_raios_seg = st.slider("Intervalo de atualização dos raios (segundos)", 10, 120, 30, step=10, disabled=not incluir_raios)
+    tocar_som = st.checkbox("Tocar som e abrir pop-up quando raio cair no range de perigo de uma unidade", value=True, disabled=not incluir_raios)
     mostrar_deslocamento = st.checkbox("Mostrar deslocamento das células de tempestade", value=True, disabled=not incluir_raios)
-    st.caption("🔄 Atualiza sozinho a cada 2 minutos enquanto a página estiver aberta.")
+    st.caption("🔄 Só os raios (pontos, células e alertas) atualizam sozinhos — o mapa em si (zoom, posição, pop-ups abertos) não é recarregado.")
 
     st.subheader("📏 Raios de alerta ao redor das unidades")
     mostrar_aneis = st.checkbox("Mostrar anéis de distância no mapa", value=False)
@@ -729,16 +789,21 @@ def _dialog_alerta_raio():
         st.session_state.dialog_raio_texto = None
         st.rerun()
 
-def _corpo_mapa_e_raios():
+def _atualizar_dados_raios():
+    """Só busca os raios, agrupa em células, checa proximidade de perigo
+    e grava tudo em static/raios_live.json. NÃO mexe no mapa — é por isso
+    que agora só os raios atualizam sozinhos, o mapa fica parado."""
     raios_df = pd.DataFrame()
     celulas_com_trajetoria = []
+    erro = None
     if incluir_raios:
         try:
             raios_df = fetch_glm_flashes_recent(minutos=raios_minutos)
             st.session_state.ultima_atualizacao_raios = datetime.now(timezone.utc)
             st.session_state.ultimo_erro_raios = None
         except Exception as e:
-            st.session_state.ultimo_erro_raios = str(e)
+            erro = str(e)
+            st.session_state.ultimo_erro_raios = erro
 
         if mostrar_deslocamento and not raios_df.empty:
             grupos = clusterizar_raios(raios_df)
@@ -761,26 +826,26 @@ def _corpo_mapa_e_raios():
                         texto = montar_mensagem_proximidade_raio(nivel, est["nome"], params["meteorologista"])
                         st.session_state.alertas_raio_ativos.insert(0, {"texto": texto, "estacao": est["nome"], "expira": time.time() + 3600})
                         st.session_state.dialog_raio_texto = texto
-                        if tocar_som: st.session_state["_tocar_beep"] = True
 
     st.session_state.alertas_raio_ativos = [a for a in st.session_state.alertas_raio_ativos if a["expira"] > time.time()]
+    st.session_state["_fragment_raios_df"] = raios_df
+    st.session_state["_fragment_celulas"] = celulas_com_trajetoria
 
-    if st.session_state.get("_tocar_beep"):
-        st.audio("data/alerta_raio.wav", autoplay=True)
-        st.session_state["_tocar_beep"] = False
+    _escrever_raios_json(raios_df, celulas_com_trajetoria, st.session_state.get("ultima_atualizacao_raios"), erro)
 
     if st.session_state.get("dialog_raio_texto"): _dialog_alerta_raio()
-
-    if hora_especifica: st.caption(f"🕐 Mostrando previsão pontual das **{hora_especifica}:00 (Brasília)** — {variavel_mapa}")
-    else: st.caption(f"📊 Mostrando o **resumo acumulado do dia** — {variavel_mapa}")
 
     if incluir_raios:
         ultima_att = st.session_state.get("ultima_atualizacao_raios")
         if ultima_att is not None:
             hora_brasilia = utc_para_brasilia(ultima_att).strftime("%H:%M:%S")
-            st.info(f"⚡ **Raios (GLM/GOES-19) atualizados às {hora_brasilia} (Brasília)** · atualiza sozinho a cada 2 minutos", icon="🕐")
+            st.caption(f"⚡ Raios (GLM/GOES-19) atualizados às **{hora_brasilia} (Brasília)** · a cada {intervalo_raios_seg}s, sem recarregar o mapa")
         erro_raios = st.session_state.get("ultimo_erro_raios")
         if erro_raios: st.warning(f"GLM indisponível no momento: {erro_raios}")
+
+def _construir_mapa():
+    if hora_especifica: st.caption(f"🕐 Mostrando previsão pontual das **{hora_especifica}:00 (Brasília)** — {variavel_mapa}")
+    else: st.caption(f"📊 Mostrando o **resumo acumulado do dia** — {variavel_mapa}")
 
     bb = BRAZIL_BOUNDS
     if unidade_focada is not None:
@@ -792,6 +857,8 @@ def _corpo_mapa_e_raios():
         m.fit_bounds([[bb["lat_min"], bb["lon_min"]], [bb["lat_max"], bb["lon_max"]]])
 
     aneis_fg = folium.FeatureGroup(name="📏 Raios de alerta ao redor das unidades", show=mostrar_aneis)
+    marcadores_js = {}
+    estacoes_para_js = []
 
     for _, e in df_estacoes.iterrows():
         if hora_especifica and e["horas"]:
@@ -818,7 +885,12 @@ def _corpo_mapa_e_raios():
 
         eh_unidade_focada = unidade_focada is not None and e["estacao"] == unidade_focada["estacao"]
         if eh_unidade_focada: folium.CircleMarker(location=[e["lat"], e["lon"]], radius=16, color="#3fc2c2", weight=2, fill=False, opacity=0.9, dash_array="4, 4").add_to(m)
-        folium.CircleMarker(location=[e["lat"], e["lon"]], radius=11 if eh_unidade_focada else 8, color=e["risco_color"], weight=3 if not eh_unidade_focada else 4, fill=True, fill_color=cor_valor, fill_opacity=0.9, tooltip=f"{e['risco_emoji']} {e['nome']} — {texto_valor}", popup=folium.Popup(popup_html, max_width=260, show=eh_unidade_focada)).add_to(m)
+        marcador_estacao = folium.CircleMarker(location=[e["lat"], e["lon"]], radius=11 if eh_unidade_focada else 8, color=e["risco_color"], weight=3 if not eh_unidade_focada else 4, fill=True, fill_color=cor_valor, fill_opacity=0.9, tooltip=f"{e['risco_emoji']} {e['nome']} — {texto_valor}", popup=folium.Popup(popup_html, max_width=260, show=eh_unidade_focada))
+        marcador_estacao.add_to(m)
+        # guarda o nome da variável JS do marcador pra poder abrir o pop-up
+        # automaticamente e checar distância quando cair um raio perto
+        marcadores_js[e["nome"]] = marcador_estacao.get_name()
+        estacoes_para_js.append({"nome": e["nome"], "lat": e["lat"], "lon": e["lon"]})
 
         if mostrar_aneis:
             for raio_km, cor_raio in RAIOS_ALERTA_KM:
@@ -826,59 +898,166 @@ def _corpo_mapa_e_raios():
                 folium.Circle(location=[e["lat"], e["lon"]], radius=raio_km * 1000, color=cor_raio, weight=1.5, fill=False, dash_array="6, 6", opacity=0.85, tooltip=f"{e['nome']} — raio de {raio_km} km").add_to(aneis_fg)
     aneis_fg.add_to(m)
 
-    if incluir_raios and not raios_df.empty:
-        agora = datetime.now(timezone.utc)
-        for _, raio in raios_df.iterrows():
-            idade_min = max((agora - raio["time"]).total_seconds() / 60, 0) if pd.notna(raio["time"]) else 0
-            fracao = min(idade_min / max(raios_minutos, 1), 1)
-            cor = "#ff2828" if fracao < 0.33 else ("#f97316" if fracao < 0.66 else "#eab308")
-            hora_raio_brasilia = utc_para_brasilia(raio["time"]).strftime("%H:%M:%S") if pd.notna(raio["time"]) else "?"
-            folium.CircleMarker(location=[raio["lat"], raio["lon"]], radius=3, color=cor, weight=1, fill=True, fill_color=cor, fill_opacity=0.8, tooltip=f"⚡ {hora_raio_brasilia} (Brasília) · ~{idade_min:.0f} min atrás").add_to(m)
-
-    if mostrar_deslocamento and celulas_com_trajetoria:
-        deslocamento_fg = folium.FeatureGroup(name="🌀 Deslocamento das células de tempestade", show=True)
-        for cel in celulas_com_trajetoria:
-            hist = cel["historico"]
-            traj = cel["trajetoria"]
-            n = len(hist)
-            pontos_linha = [[p["lat"], p["lon"]] for p in hist] + [[c["lat"], c["lon"]] for c in traj["checkpoints"]]
-            folium.PolyLine(pontos_linha, color="#e5e7eb", weight=1.5, opacity=0.55, dash_array="6, 5").add_to(deslocamento_fg)
-            for i, p in enumerate(hist):
-                fracao = i / (n - 1) if n > 1 else 1
-                if fracao <= 0.5: a, b_, t = (239, 68, 68), (234, 179, 8), fracao / 0.5
-                else: a, b_, t = (234, 179, 8), (34, 197, 94), (fracao - 0.5) / 0.5
-                cor_x = f"rgb({round(a[0]+(b_[0]-a[0])*t)},{round(a[1]+(b_[1]-a[1])*t)},{round(a[2]+(b_[2]-a[2])*t)})"
-                eh_atual = (i == n - 1)
-                tamanho = 18 if eh_atual else 13
-                icone = folium.DivIcon(html=(f'<div style="font-weight:900; font-size:{tamanho}px; color:{cor_x}; text-shadow:0 0 4px #000,0 0 7px #000; line-height:1;">✕</div>'), icon_size=(tamanho + 6, tamanho + 6), icon_anchor=((tamanho + 6) // 2, (tamanho + 6) // 2))
-                marcador = folium.Marker(location=[p["lat"], p["lon"]], icon=icone)
-                if eh_atual: marcador.add_child(folium.Tooltip(f"Célula #{cel['id']} · {p['n']} raios · ~{traj['vel_kmh']:.0f} km/h para {traj['rumo_texto']}"))
-                marcador.add_to(deslocamento_fg)
-            for idx_c, c in enumerate(traj["checkpoints"]):
-                opacidade = max(0.75 - idx_c * 0.18, 0.2)
-                hora_estim = utc_para_brasilia(datetime.now(timezone.utc) + timedelta(minutes=c["min"])).strftime("%H:%M")
-                folium.CircleMarker(location=[c["lat"], c["lon"]], radius=3.5, color="#e5e7eb", weight=1, fill=True, fill_color="#e5e7eb", fill_opacity=opacidade, opacity=opacidade, tooltip=f"Célula #{cel['id']} — alcance estimado em +{c['min']} min (~{hora_estim} Brasília)").add_to(deslocamento_fg)
-        deslocamento_fg.add_to(m)
-
+    raios_fg = folium.FeatureGroup(name="⚡ Raios ao vivo", show=True)
+    raios_fg.add_to(m)
     folium.LayerControl(collapsed=True).add_to(m)
-    st_folium(m, height=620, use_container_width=True, returned_objects=[], key="mapa_principal")
 
-    # Modificado para não retornar valores diretos na função decorada com @st.fragment
-    st.session_state["_fragment_raios_df"] = raios_df
-    st.session_state["_fragment_celulas"] = celulas_com_trajetoria
+    # --------------------------------------------------------------
+    # JS que atualiza SÓ os raios (pontos + células de deslocamento),
+    # lendo periodicamente static/raios_live.json — o resto do mapa
+    # (tiles, estações, anéis, zoom, pop-ups abertos) fica intocado.
+    # Quando um raio cai no range de perigo (30/50 km) de uma unidade,
+    # abre o pop-up daquela unidade no mapa e toca o som de alerta.
+    # --------------------------------------------------------------
+    if incluir_raios:
+        map_var = m.get_name()
+        raios_fg_var = raios_fg.get_name()
+        js_payload = {
+            "estacoes": estacoes_para_js,
+            "marcadores": marcadores_js,
+            "intervaloMs": int(intervalo_raios_seg) * 1000,
+            "janelaMin": raios_minutos,
+            "somUrl": f"app/static/{SOM_ALERTA_NOME}",
+            "jsonUrl": "app/static/raios_live.json",
+            "niveisPerigoKm": [30, 50],
+            "cooldownMs": 3600 * 1000,
+            "mostrarDeslocamento": bool(mostrar_deslocamento),
+            "tocarSom": bool(tocar_som),
+        }
+        js_payload_str = json.dumps(js_payload, ensure_ascii=False).replace("</", "<\\/")
+        script_html = f"""
+<div id="raios-status-bar" style="position:absolute; z-index:1000; top:8px; left:50px; background:rgba(15,15,20,0.75); color:#e5e7eb; padding:4px 10px; border-radius:6px; font:12px sans-serif;">
+  ⚡ carregando raios…
+  <button id="raios-som-btn" style="margin-left:8px; font:11px sans-serif; cursor:pointer; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:4px; padding:1px 6px;">🔊 ativar som</button>
+</div>
+<script>
+// "load" garante que isso só roda DEPOIS do script principal do Folium
+// (que cria o mapa e os marcadores), não importa a ordem no HTML.
+window.addEventListener("load", function() {{
+    var cfg = {js_payload_str};
+    var map = window["{map_var}"];
+    var raiosLayer = window["{raios_fg_var}"];
+    var celulasLayer = L.layerGroup().addTo(map);
+    var audio = new Audio(cfg.somUrl);
+    audio.preload = "auto";
+    var somLiberado = false;
+    var ultimoAlerta = {{}};
+    var statusEl = document.getElementById("raios-status-bar");
+    var btnSom = document.getElementById("raios-som-btn");
+    if (btnSom) {{
+        btnSom.onclick = function() {{
+            audio.play().then(function() {{ audio.pause(); audio.currentTime = 0; somLiberado = true; btnSom.innerText = "🔊 som ativado"; }}).catch(function() {{}});
+        }};
+    }}
 
+    function distKm(lat1, lon1, lat2, lon2) {{
+        return Math.sqrt(Math.pow(lat1 - lat2, 2) + Math.pow(lon1 - lon2, 2)) * 111;
+    }}
 
-if incluir_raios:
-    mapa_fragment = st.fragment(run_every=120)(_corpo_mapa_e_raios)
-else:
-    mapa_fragment = st.fragment(_corpo_mapa_e_raios)
+    function corPorIdade(idadeMin) {{
+        var fracao = Math.min(idadeMin / Math.max(cfg.janelaMin, 1), 1);
+        if (fracao < 0.33) return "#ff2828";
+        if (fracao < 0.66) return "#f97316";
+        return "#eab308";
+    }}
+
+    function checarPerigo(raios) {{
+        if (!cfg.tocarSom) return;
+        var agora = Date.now();
+        raios.forEach(function(r) {{
+            cfg.estacoes.forEach(function(est) {{
+                var d = distKm(r.lat, r.lon, est.lat, est.lon);
+                cfg.niveisPerigoKm.forEach(function(nivel) {{
+                    if (d > nivel) return;
+                    var chave = est.nome + "_" + nivel;
+                    if (ultimoAlerta[chave] && (agora - ultimoAlerta[chave]) < cfg.cooldownMs) return;
+                    ultimoAlerta[chave] = agora;
+                    var nomeVar = cfg.marcadores[est.nome];
+                    var marcador = nomeVar ? window[nomeVar] : null;
+                    if (marcador && marcador.openPopup) {{
+                        marcador.openPopup();
+                        if (map.setView) map.panTo(marcador.getLatLng());
+                    }}
+                    audio.currentTime = 0;
+                    audio.play().catch(function() {{}});
+                }});
+            }});
+        }});
+    }}
+
+    function desenharRaios(data) {{
+        raiosLayer.clearLayers();
+        (data.raios || []).forEach(function(r) {{
+            var cor = corPorIdade(r.idade_min);
+            L.circleMarker([r.lat, r.lon], {{radius: 3, color: cor, weight: 1, fill: true, fillColor: cor, fillOpacity: 0.8}})
+                .bindTooltip("⚡ " + r.hora + " (Brasília) · ~" + Math.round(r.idade_min) + " min atrás")
+                .addTo(raiosLayer);
+        }});
+
+        celulasLayer.clearLayers();
+        if (cfg.mostrarDeslocamento) {{
+            (data.celulas || []).forEach(function(cel) {{
+                var hist = cel.historico || [];
+                var pts = hist.map(function(p) {{ return [p.lat, p.lon]; }})
+                    .concat((cel.checkpoints || []).map(function(c) {{ return [c.lat, c.lon]; }}));
+                if (pts.length > 1) {{
+                    L.polyline(pts, {{color: "#e5e7eb", weight: 1.5, opacity: 0.55, dashArray: "6, 5"}}).addTo(celulasLayer);
+                }}
+                hist.forEach(function(p, i) {{
+                    var atual = (i === hist.length - 1);
+                    var tam = atual ? 18 : 13;
+                    var icone = L.divIcon({{
+                        html: '<div style="font-weight:900; font-size:' + tam + 'px; color:' + (atual ? "#ef4444" : "#eab308") + '; text-shadow:0 0 4px #000,0 0 7px #000; line-height:1;">✕</div>',
+                        iconSize: [tam + 6, tam + 6], iconAnchor: [(tam + 6) / 2, (tam + 6) / 2]
+                    }});
+                    var marc = L.marker([p.lat, p.lon], {{icon: icone}});
+                    if (atual) marc.bindTooltip("Célula #" + cel.id + " · ~" + Math.round(cel.vel_kmh) + " km/h para " + cel.rumo_texto);
+                    marc.addTo(celulasLayer);
+                }});
+                (cel.checkpoints || []).forEach(function(c, idx) {{
+                    var op = Math.max(0.75 - idx * 0.18, 0.2);
+                    L.circleMarker([c.lat, c.lon], {{radius: 3.5, color: "#e5e7eb", weight: 1, fill: true, fillColor: "#e5e7eb", fillOpacity: op, opacity: op}})
+                        .bindTooltip("Célula #" + cel.id + " — alcance estimado em +" + c.min + " min")
+                        .addTo(celulasLayer);
+                }});
+            }});
+        }}
+    }}
+
+    function atualizar() {{
+        fetch(cfg.jsonUrl + "?t=" + Date.now())
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                desenharRaios(data);
+                checarPerigo(data.raios || []);
+                if (statusEl) {{
+                    var txt = data.erro ? ("⚠️ GLM indisponível: " + data.erro) : ("⚡ raios atualizados às " + (data.atualizado_em_brasilia || "—") + " (Brasília)");
+                    statusEl.childNodes[0].nodeValue = txt + " ";
+                }}
+            }})
+            .catch(function(e) {{ if (statusEl) statusEl.childNodes[0].nodeValue = "⚠️ não foi possível ler os raios "; }});
+    }}
+
+    atualizar();
+    setInterval(atualizar, cfg.intervaloMs);
+}});
+</script>
+"""
+        m.get_root().html.add_child(folium.Element(script_html))
+
+    components.html(m._repr_html_(), height=650)
+
 
 with col_mapa:
-    mapa_fragment()
+    if incluir_raios:
+        st.fragment(run_every=intervalo_raios_seg)(_atualizar_dados_raios)()
+    else:
+        _atualizar_dados_raios()
 
-# Resgatando do session state
-raios_df = st.session_state.get("_fragment_raios_df", pd.DataFrame())
-celulas_com_trajetoria = st.session_state.get("_fragment_celulas", [])
+    raios_df = st.session_state.get("_fragment_raios_df", pd.DataFrame())
+    celulas_com_trajetoria = st.session_state.get("_fragment_celulas", [])
+
+    _construir_mapa()
 
 with col_lado:
     if unidade_focada is not None:
@@ -932,7 +1111,7 @@ with col_lado:
     with tab_raio:
         if incluir_raios:
             ultima_att = st.session_state.get("ultima_atualizacao_raios")
-            if ultima_att is not None: st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')} (Brasília)** · janela de {raios_minutos} min · atualiza a cada 2 min")
+            if ultima_att is not None: st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')} (Brasília)** · janela de {raios_minutos} min · atualiza a cada {intervalo_raios_seg}s")
             if celulas_com_trajetoria:
                 st.markdown(f"**{len(celulas_com_trajetoria)} célula(s) de tempestade em deslocamento:**")
                 for cel in celulas_com_trajetoria:
