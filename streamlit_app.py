@@ -10,6 +10,7 @@ import re
 import shutil
 import time
 import unicodedata
+import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -764,12 +765,7 @@ if df_estacoes.empty:
     st.warning("Nenhum dado horário disponível pra essa combinação de data/horários.")
     st.stop()
 
-mostrar_paineis_lado = st.toggle("📑 Mostrar painéis laterais (Risco · Ranking · Alertas · Raios · Contatos)", value=st.session_state.get("mostrar_paineis_lado", True), key="mostrar_paineis_lado")
-if mostrar_paineis_lado:
-    col_mapa, col_lado = st.columns([2.4, 1])
-else:
-    col_mapa = st.container()
-    col_lado = None
+col_mapa, col_lado = st.columns([2.4, 1])
 
 var_map = {"Rajada de vento": ("max_gust", gust_color_hex, "km/h"), "Precipitação": ("soma_precip", rain_color_hex, "mm"), "CAPE": ("max_cape", cape_color_hex, "J/kg")}
 chave_var, color_fn, unidade_var = var_map[variavel_mapa]
@@ -870,24 +866,13 @@ def _construir_mapa():
 
         popup_html = (f"<b>{e['risco_emoji']} {e['nome']}</b><br/>Risco combinado: <b style='color:{e['risco_color']}'>{e['risco_label']}</b><br/>{variavel_mapa} {'às ' + hora_especifica + ':00' if hora_especifica else '(resumo do dia)'}: <b>{texto_valor}</b><br/><hr/>Rajada máx. do dia: {e['max_gust']:.0f} km/h<br/>Chuva acum. do dia: {e['soma_precip']:.1f} mm<br/>CAPE máx. do dia: {e['max_cape']:.0f} J/kg")
 
-        if e["horas"]:
-            linhas_tabela = ""
-            for h, g_v, p_v, c_v in zip(e["horas"], e["gusts"], e["precip"], e["capes"]):
-                g_txt = f"{g_v:.0f}" if g_v is not None else "—"
-                p_txt = f"{p_v:.1f}" if p_v is not None else "—"
-                c_txt = f"{c_v:.0f}" if c_v is not None else "—"
-                linhas_tabela += f"<tr><td>{h}</td><td>{g_txt}</td><td>{p_txt}</td><td>{c_txt}</td></tr>"
-            popup_html += (
-                "<hr/><b>🕐 Previsão horária do dia</b>"
-                "<div style='max-height:180px; overflow-y:auto; margin-top:4px;'>"
-                "<table style='width:100%; font-size:11px; border-collapse:collapse;'>"
-                "<thead><tr style='position:sticky; top:0; background:#111827;'>"
-                "<th style='text-align:left; padding:2px 4px;'>Hora</th>"
-                "<th style='text-align:right; padding:2px 4px;'>Rajada km/h</th>"
-                "<th style='text-align:right; padding:2px 4px;'>Chuva mm</th>"
-                "<th style='text-align:right; padding:2px 4px;'>CAPE J/kg</th>"
-                f"</tr></thead><tbody>{linhas_tabela}</tbody></table></div>"
-            )
+        estacao_url = urllib.parse.quote(e["estacao"])
+        popup_html += (
+            f"<br/><a href='?unidade_previsao={estacao_url}' target='_top' "
+            "style='display:inline-block; margin-top:6px; padding:4px 10px; background:#2563eb; "
+            "color:#fff; border-radius:5px; text-decoration:none; font-size:12px;'>"
+            "📈 Ver previsão horária completa</a>"
+        )
 
         if e["contatos"]:
             popup_html += f"<hr/><b>📞 {e['contatos']['nome']}</b><br/>"
@@ -956,6 +941,48 @@ window.addEventListener("load", function() {{
 """
     m.get_root().html.add_child(folium.Element(busca_html))
 
+    # --------------------------------------------------------------
+    # Botão pra retrair/mostrar os painéis laterais (Risco, Ranking,
+    # Alertas, Raios, Contatos, Previsão horária) sem recarregar nada
+    # — mexe só no CSS da página principal, igual o "«" da barra lateral
+    # esquerda nativa do Streamlit.
+    # --------------------------------------------------------------
+    retrair_html = """
+<script>
+window.addEventListener("load", function() {
+    try {
+        var parentDoc = window.parent.document;
+        if (parentDoc.getElementById("toggle-painel-lateral-btn")) return;
+        var btn = parentDoc.createElement("button");
+        btn.id = "toggle-painel-lateral-btn";
+        btn.innerText = "» painéis";
+        btn.title = "Retrair/mostrar painéis laterais";
+        btn.style.cssText = "position:fixed; top:8px; right:14px; z-index:9999; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:6px; padding:5px 10px; cursor:pointer; font:12px sans-serif;";
+        parentDoc.body.appendChild(btn);
+        btn.addEventListener("click", function() {
+            var painel = parentDoc.querySelector(".st-key-painel_lateral");
+            if (!painel) return;
+            var coluna = painel.closest('[data-testid="stColumn"]');
+            if (!coluna) return;
+            var linha = coluna.parentElement;
+            var oculto = coluna.style.display === "none";
+            coluna.style.display = oculto ? "" : "none";
+            btn.innerText = oculto ? "» painéis" : "« painéis";
+            if (linha) {
+                linha.querySelectorAll('[data-testid="stColumn"]').forEach(function(c) {
+                    if (c !== coluna) {
+                        c.style.flex = oculto ? "" : "1 1 100%";
+                        c.style.width = oculto ? "" : "100%";
+                        c.style.maxWidth = oculto ? "" : "100%";
+                    }
+                });
+            }
+        });
+    } catch (e) {}
+});
+</script>
+"""
+    m.get_root().html.add_child(folium.Element(retrair_html))
 
     # JS que atualiza SÓ os raios (pontos + células de deslocamento),
     # lendo periodicamente static/raios_live.json — o resto do mapa
@@ -1117,25 +1144,42 @@ with col_mapa:
 
     _construir_mapa()
 
-if col_lado is not None:
-    with col_lado:
-        st.selectbox("📊 Unidade para comparar modelos (GFS · ICON · ECMWF)", ["— Nenhuma —"] + sorted(df_estacoes["estacao"].tolist(), key=lambda s: s.lower()), key="unidade_comparacao")
-        unidade_comp_nome = st.session_state.get("unidade_comparacao", "— Nenhuma —")
+with col_lado:
+    with st.container(key="painel_lateral"):
         unidade_focada = None
-        if unidade_comp_nome != "— Nenhuma —":
-            linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_comp_nome]
+        unidade_clicada_nome = st.query_params.get("unidade_previsao")
+        if unidade_clicada_nome:
+            linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_clicada_nome]
             if not linhas_foco.empty: unidade_focada = linhas_foco.iloc[0]
 
-        if unidade_focada is not None:
-            with st.container(border=True):
-                st.markdown(f"**📊 Comparação de modelos — {unidade_focada['nome']}**")
-                dfs_base_comp = st.session_state.get("dfs_base")
-                if not dfs_base_comp: st.info("Gere o mapa pelo menos uma vez pra ver a comparação entre modelos.")
+        tab_horaria, tab_risco, tab_rank, tab_alertas, tab_raio, tab_contatos = st.tabs(["📈 Horária", "🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📞 Contatos"])
+
+        with tab_horaria:
+            if unidade_focada is None:
+                st.info("👆 Clique numa unidade no mapa para ver a previsão horária do dia.")
+            else:
+                st.markdown(f"**📈 Previsão horária — {unidade_focada['nome']}**")
+                if st.button("✕ limpar seleção", key="limpar_unidade_previsao"):
+                    if "unidade_previsao" in st.query_params: del st.query_params["unidade_previsao"]
+                    st.rerun()
+                horas_full = [f"{h:02d}:00" for h in range(24)]
+                tabela_horaria = pd.DataFrame({"hora": horas_full}).set_index("hora")
+                tabela_horaria["Rajada (km/h)"] = pd.Series(dict(zip(unidade_focada["horas"], unidade_focada["gusts"])))
+                tabela_horaria["Chuva (mm)"] = pd.Series(dict(zip(unidade_focada["horas"], unidade_focada["precip"])))
+                tabela_horaria["CAPE (J/kg)"] = pd.Series(dict(zip(unidade_focada["horas"], unidade_focada["capes"])))
+                tabela_horaria = tabela_horaria.dropna(how="all")
+                if tabela_horaria.empty:
+                    st.warning("Sem dados horários pra essa unidade/dia.")
                 else:
+                    st.line_chart(tabela_horaria[["Rajada (km/h)"]], height=180)
+                    st.line_chart(tabela_horaria[["Chuva (mm)"]], height=140)
+                    st.line_chart(tabela_horaria[["CAPE (J/kg)"]], height=140)
+
+                dfs_base_comp = st.session_state.get("dfs_base")
+                if dfs_base_comp:
                     var_comp_map = {"Rajada de vento": ("wind_gust_kmh", "km/h"), "Precipitação": ("precip_mm", "mm"), "CAPE": ("cape_jkg", "J/kg")}
                     coluna_comp, unidade_comp = var_comp_map[variavel_mapa]
-                    st.caption(f"GFS · ICON · ECMWF — {variavel_mapa}, todas as 24h de {params['target_date']}")
-                    horas_full = [f"{h:02d}:00" for h in range(24)]
+                    st.caption(f"Comparação entre modelos — GFS · ICON · ECMWF — {variavel_mapa}")
                     tabela_comp = pd.DataFrame({"hora": horas_full}).set_index("hora")
                     for modelo_id, label in [("gfs_seamless", "GFS"), ("icon_seamless", "ICON"), ("ecmwf_ifs025", "ECMWF")]:
                         d_modelo = dfs_base_comp.get(modelo_id)
@@ -1147,12 +1191,9 @@ if col_lado is not None:
                         if coluna_comp == "wind_gust_kmh": serie = serie * (1 + params["margin_pct"] / 100)
                         tabela_comp[label] = serie
                     tabela_comp = tabela_comp.dropna(how="all")
-                    if tabela_comp.empty: st.warning("Sem dados de comparação pra essa estação/dia.")
-                    else:
+                    if not tabela_comp.empty:
                         st.line_chart(tabela_comp, height=220)
                         st.caption(f"Valores em {unidade_comp}. Quanto mais os modelos concordam, maior a confiança.")
-
-        tab_risco, tab_rank, tab_alertas, tab_raio, tab_contatos = st.tabs(["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📞 Contatos"])
 
         with tab_risco:
             em_risco = df_estacoes[df_estacoes["risco_score"] > 0].sort_values("risco_score", ascending=False)
