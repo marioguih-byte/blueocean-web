@@ -260,11 +260,11 @@ def montar_mensagem_proximidade_raio(nivel, nome_estacao, meteorologista):
     validade = agora + timedelta(hours=1)
     janela = "-15 min até o momento" if nivel == 30 else "-30 min até o momento"
     emoji = "🔴" if nivel == 30 else "🟡"
-    return (f"{emoji} {agora.strftime('%d/%m/%Y')} - {agora.strftime('%H:%M')} (Brasília)\n"
+    return (f"{emoji} {agora.strftime('%d/%m/%Y')} - {agora.strftime('%H:%M')}\n"
             f"* Local: {nome_estacao}\n"
             f"* Meteorologista: {meteorologista or '(não informado)'}\n"
             f"* Raios próximos de sua região ({janela})\n"
-            f"Válido até as {validade.strftime('%H:%M')} (Brasília)")
+            f"Válido até as {validade.strftime('%H:%M')}")
 
 RISCO_NIVEIS = [
     {"label": "Baixo", "emoji": "🟢", "color": "#22c55e"},
@@ -692,7 +692,7 @@ with st.sidebar:
     st.subheader("📅 Data e horários")
     target_date = st.date_input("Data da previsão", value=datetime.now().date())
     todas_horas = [f"{h:02d}" for h in range(24)]
-    horas_selecionadas = st.multiselect("Horários (horário de Brasília) a incluir", todas_horas, default=todas_horas)
+    horas_selecionadas = st.multiselect("Horários a incluir", todas_horas, default=todas_horas)
 
     st.subheader("🌬 Modelos")
     modelos_valores = ["gfs_seamless", "icon_seamless", "ecmwf_ifs025", "ensemble"]
@@ -715,16 +715,12 @@ with st.sidebar:
     mostrar_aneis = st.checkbox("Mostrar anéis de distância no mapa", value=False)
     distancias_aneis = st.multiselect("Distâncias (km)", [30, 50, 100, 150, 200], default=[30, 50, 100, 150, 200], disabled=not mostrar_aneis)
 
-    st.subheader("🏭 Selecionar unidade")
-    nomes_unidades_mapa = ["— Nenhuma (ver tudo) —"] + sorted(df_stations["estacao"].tolist(), key=lambda s: s.lower())
-    unidade_selecionada = st.selectbox("Buscar / selecionar unidade", nomes_unidades_mapa, help="Digite pra filtrar ou escolha na lista — o mapa centraliza na unidade escolhida.")
-
     st.subheader("🗺️ Variável e horário no mapa")
     variavel_mapa = st.radio("Variável exibida", ["Rajada de vento", "Precipitação", "CAPE"], horizontal=False)
     modo_horario = st.radio("Modo de exibição", ["Resumo do dia (acumulado)", "Hora específica"], horizontal=False)
     hora_especifica = None
     if modo_horario == "Hora específica" and horas_selecionadas:
-        hora_especifica = st.select_slider("Horário (Brasília)", options=sorted(horas_selecionadas), value=sorted(horas_selecionadas)[0])
+        hora_especifica = st.select_slider("Horário", options=sorted(horas_selecionadas), value=sorted(horas_selecionadas)[0])
 
     gerar = st.button("🌍 Gerar / Atualizar mapa", type="primary", use_container_width=True)
 
@@ -768,16 +764,16 @@ if df_estacoes.empty:
     st.warning("Nenhum dado horário disponível pra essa combinação de data/horários.")
     st.stop()
 
-col_mapa, col_lado = st.columns([2.4, 1])
+mostrar_paineis_lado = st.toggle("📑 Mostrar painéis laterais (Risco · Ranking · Alertas · Raios · Contatos)", value=st.session_state.get("mostrar_paineis_lado", True), key="mostrar_paineis_lado")
+if mostrar_paineis_lado:
+    col_mapa, col_lado = st.columns([2.4, 1])
+else:
+    col_mapa = st.container()
+    col_lado = None
 
 var_map = {"Rajada de vento": ("max_gust", gust_color_hex, "km/h"), "Precipitação": ("soma_precip", rain_color_hex, "mm"), "CAPE": ("max_cape", cape_color_hex, "J/kg")}
 chave_var, color_fn, unidade_var = var_map[variavel_mapa]
 chave_dado_hora = {"Rajada de vento": "gusts", "Precipitação": "precip", "CAPE": "capes"}[variavel_mapa]
-
-unidade_focada = None
-if unidade_selecionada != "— Nenhuma (ver tudo) —":
-    linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_selecionada]
-    if not linhas_foco.empty: unidade_focada = linhas_foco.iloc[0]
 
 @st.dialog("⚡ Raio próximo de uma unidade!")
 def _dialog_alerta_raio():
@@ -839,22 +835,19 @@ def _atualizar_dados_raios():
         ultima_att = st.session_state.get("ultima_atualizacao_raios")
         if ultima_att is not None:
             hora_brasilia = utc_para_brasilia(ultima_att).strftime("%H:%M:%S")
-            st.caption(f"⚡ Raios (GLM/GOES-19) atualizados às **{hora_brasilia} (Brasília)** · a cada {intervalo_raios_seg}s, sem recarregar o mapa")
+            st.caption(f"⚡ Raios (GLM/GOES-19) atualizados às **{hora_brasilia}** · a cada {intervalo_raios_seg}s, sem recarregar o mapa")
         erro_raios = st.session_state.get("ultimo_erro_raios")
         if erro_raios: st.warning(f"GLM indisponível no momento: {erro_raios}")
 
 def _construir_mapa():
-    if hora_especifica: st.caption(f"🕐 Mostrando previsão pontual das **{hora_especifica}:00 (Brasília)** — {variavel_mapa}")
+    if hora_especifica: st.caption(f"🕐 Mostrando previsão pontual das **{hora_especifica}:00** — {variavel_mapa}")
     else: st.caption(f"📊 Mostrando o **resumo acumulado do dia** — {variavel_mapa}")
 
     bb = BRAZIL_BOUNDS
-    if unidade_focada is not None:
-        m = folium.Map(location=[unidade_focada["lat"], unidade_focada["lon"]], zoom_start=10, tiles="CartoDB dark_matter", control_scale=True, min_lat=bb["lat_min"], max_lat=bb["lat_max"], min_lon=bb["lon_min"], max_lon=bb["lon_max"], max_bounds=True, min_zoom=4, max_zoom=14, maxBoundsViscosity=1.0)
-    else:
-        center_lat = (bb["lat_min"] + bb["lat_max"]) / 2
-        center_lon = (bb["lon_min"] + bb["lon_max"]) / 2
-        m = folium.Map(location=[center_lat, center_lon], tiles="CartoDB dark_matter", control_scale=True, min_lat=bb["lat_min"], max_lat=bb["lat_max"], min_lon=bb["lon_min"], max_lon=bb["lon_max"], max_bounds=True, min_zoom=4, max_zoom=14, maxBoundsViscosity=1.0)
-        m.fit_bounds([[bb["lat_min"], bb["lon_min"]], [bb["lat_max"], bb["lon_max"]]])
+    center_lat = (bb["lat_min"] + bb["lat_max"]) / 2
+    center_lon = (bb["lon_min"] + bb["lon_max"]) / 2
+    m = folium.Map(location=[center_lat, center_lon], tiles="CartoDB dark_matter", control_scale=True, min_lat=bb["lat_min"], max_lat=bb["lat_max"], min_lon=bb["lon_min"], max_lon=bb["lon_max"], max_bounds=True, min_zoom=4, max_zoom=14, maxBoundsViscosity=1.0)
+    m.fit_bounds([[bb["lat_min"], bb["lon_min"]], [bb["lat_max"], bb["lon_max"]]])
 
     aneis_fg = folium.FeatureGroup(name="📏 Raios de alerta ao redor das unidades", show=mostrar_aneis)
     marcadores_js = {}
@@ -875,7 +868,27 @@ def _construir_mapa():
             cor_valor = color_fn(valor_exibido)
             texto_valor = f"{valor_exibido:.1f} {unidade_var}"
 
-        popup_html = (f"<b>{e['risco_emoji']} {e['nome']}</b><br/>Risco combinado: <b style='color:{e['risco_color']}'>{e['risco_label']}</b><br/>{variavel_mapa} {'às ' + hora_especifica + ':00 (Brasília)' if hora_especifica else '(resumo do dia)'}: <b>{texto_valor}</b><br/><hr/>Rajada máx. do dia: {e['max_gust']:.0f} km/h<br/>Chuva acum. do dia: {e['soma_precip']:.1f} mm<br/>CAPE máx. do dia: {e['max_cape']:.0f} J/kg")
+        popup_html = (f"<b>{e['risco_emoji']} {e['nome']}</b><br/>Risco combinado: <b style='color:{e['risco_color']}'>{e['risco_label']}</b><br/>{variavel_mapa} {'às ' + hora_especifica + ':00' if hora_especifica else '(resumo do dia)'}: <b>{texto_valor}</b><br/><hr/>Rajada máx. do dia: {e['max_gust']:.0f} km/h<br/>Chuva acum. do dia: {e['soma_precip']:.1f} mm<br/>CAPE máx. do dia: {e['max_cape']:.0f} J/kg")
+
+        if e["horas"]:
+            linhas_tabela = ""
+            for h, g_v, p_v, c_v in zip(e["horas"], e["gusts"], e["precip"], e["capes"]):
+                g_txt = f"{g_v:.0f}" if g_v is not None else "—"
+                p_txt = f"{p_v:.1f}" if p_v is not None else "—"
+                c_txt = f"{c_v:.0f}" if c_v is not None else "—"
+                linhas_tabela += f"<tr><td>{h}</td><td>{g_txt}</td><td>{p_txt}</td><td>{c_txt}</td></tr>"
+            popup_html += (
+                "<hr/><b>🕐 Previsão horária do dia</b>"
+                "<div style='max-height:180px; overflow-y:auto; margin-top:4px;'>"
+                "<table style='width:100%; font-size:11px; border-collapse:collapse;'>"
+                "<thead><tr style='position:sticky; top:0; background:#111827;'>"
+                "<th style='text-align:left; padding:2px 4px;'>Hora</th>"
+                "<th style='text-align:right; padding:2px 4px;'>Rajada km/h</th>"
+                "<th style='text-align:right; padding:2px 4px;'>Chuva mm</th>"
+                "<th style='text-align:right; padding:2px 4px;'>CAPE J/kg</th>"
+                f"</tr></thead><tbody>{linhas_tabela}</tbody></table></div>"
+            )
+
         if e["contatos"]:
             popup_html += f"<hr/><b>📞 {e['contatos']['nome']}</b><br/>"
             for item in e["contatos"]["numeros"][:3]:
@@ -883,9 +896,7 @@ def _construir_mapa():
                 if item.get("descricao"): popup_html += f" <i>({item['descricao']})</i>"
                 popup_html += "<br/>"
 
-        eh_unidade_focada = unidade_focada is not None and e["estacao"] == unidade_focada["estacao"]
-        if eh_unidade_focada: folium.CircleMarker(location=[e["lat"], e["lon"]], radius=16, color="#3fc2c2", weight=2, fill=False, opacity=0.9, dash_array="4, 4").add_to(m)
-        marcador_estacao = folium.CircleMarker(location=[e["lat"], e["lon"]], radius=11 if eh_unidade_focada else 8, color=e["risco_color"], weight=3 if not eh_unidade_focada else 4, fill=True, fill_color=cor_valor, fill_opacity=0.9, tooltip=f"{e['risco_emoji']} {e['nome']} — {texto_valor}", popup=folium.Popup(popup_html, max_width=260, show=eh_unidade_focada))
+        marcador_estacao = folium.CircleMarker(location=[e["lat"], e["lon"]], radius=8, color=e["risco_color"], weight=3, fill=True, fill_color=cor_valor, fill_opacity=0.9, tooltip=f"{e['risco_emoji']} {e['nome']} — {texto_valor}", popup=folium.Popup(popup_html, max_width=320, show=False))
         marcador_estacao.add_to(m)
         # guarda o nome da variável JS do marcador pra poder abrir o pop-up
         # automaticamente e checar distância quando cair um raio perto
@@ -903,6 +914,49 @@ def _construir_mapa():
     folium.LayerControl(collapsed=True).add_to(m)
 
     # --------------------------------------------------------------
+    # Busca de unidade 100% em JS: digitar/escolher aqui só dá zoom +
+    # abre o pop-up da unidade no mapa já carregado. Não passa pelo
+    # Streamlit, então não recarrega nem reconstrói nada — é só zoom.
+    # --------------------------------------------------------------
+    map_var_busca = m.get_name()
+    estacoes_busca_json = json.dumps(estacoes_para_js, ensure_ascii=False).replace("</", "<\\/")
+    marcadores_busca_json = json.dumps(marcadores_js, ensure_ascii=False).replace("</", "<\\/")
+    options_html = "".join(f'<option value="{e["nome"]}">' for e in estacoes_para_js)
+    busca_html = f"""
+<div id="busca-unidade-bar" style="position:absolute; z-index:1000; top:8px; right:50px; background:rgba(15,15,20,0.75); padding:4px 8px; border-radius:6px;">
+  <input id="busca-unidade-input" list="busca-unidade-lista" placeholder="🔎 Buscar unidade…" autocomplete="off"
+    style="width:180px; font:12px sans-serif; padding:3px 6px; border-radius:4px; border:1px solid #374151; background:#111827; color:#e5e7eb;">
+  <datalist id="busca-unidade-lista">{options_html}</datalist>
+</div>
+<script>
+window.addEventListener("load", function() {{
+    var mapaBusca = window["{map_var_busca}"];
+    var estacoesBusca = {estacoes_busca_json};
+    var marcadoresBusca = {marcadores_busca_json};
+    var inputBusca = document.getElementById("busca-unidade-input");
+    if (!inputBusca) return;
+
+    function irParaUnidade(nome) {{
+        var est = estacoesBusca.find(function(e) {{ return e.nome === nome; }});
+        if (!est || !mapaBusca) return;
+        mapaBusca.flyTo([est.lat, est.lon], 10, {{animate: true, duration: 0.8}});
+        var nomeVar = marcadoresBusca[nome];
+        var marcador = nomeVar ? window[nomeVar] : null;
+        if (marcador && marcador.openPopup) {{
+            setTimeout(function() {{ marcador.openPopup(); }}, 400);
+        }}
+    }}
+
+    inputBusca.addEventListener("change", function() {{ irParaUnidade(inputBusca.value); }});
+    inputBusca.addEventListener("keydown", function(ev) {{
+        if (ev.key === "Enter") irParaUnidade(inputBusca.value);
+    }});
+}});
+</script>
+"""
+    m.get_root().html.add_child(folium.Element(busca_html))
+
+
     # JS que atualiza SÓ os raios (pontos + células de deslocamento),
     # lendo periodicamente static/raios_live.json — o resto do mapa
     # (tiles, estações, anéis, zoom, pop-ups abertos) fica intocado.
@@ -993,7 +1047,7 @@ window.addEventListener("load", function() {{
         (data.raios || []).forEach(function(r) {{
             var cor = corPorIdade(r.idade_min);
             L.circleMarker([r.lat, r.lon], {{radius: 3, color: cor, weight: 1, fill: true, fillColor: cor, fillOpacity: 0.8}})
-                .bindTooltip("⚡ " + r.hora + " (Brasília) · ~" + Math.round(r.idade_min) + " min atrás")
+                .bindTooltip("⚡ " + r.hora + " · ~" + Math.round(r.idade_min) + " min atrás")
                 .addTo(raiosLayer);
         }});
 
@@ -1035,7 +1089,7 @@ window.addEventListener("load", function() {{
                 desenharRaios(data);
                 checarPerigo(data.raios || []);
                 if (statusEl) {{
-                    var txt = data.erro ? ("⚠️ GLM indisponível: " + data.erro) : ("⚡ raios atualizados às " + (data.atualizado_em_brasilia || "—") + " (Brasília)");
+                    var txt = data.erro ? ("⚠️ GLM indisponível: " + data.erro) : ("⚡ raios atualizados às " + (data.atualizado_em_brasilia || "—"));
                     statusEl.childNodes[0].nodeValue = txt + " ";
                 }}
             }})
@@ -1063,78 +1117,86 @@ with col_mapa:
 
     _construir_mapa()
 
-with col_lado:
-    if unidade_focada is not None:
-        with st.container(border=True):
-            st.markdown(f"**📊 Comparação de modelos — {unidade_focada['nome']}**")
-            dfs_base_comp = st.session_state.get("dfs_base")
-            if not dfs_base_comp: st.info("Gere o mapa pelo menos uma vez pra ver a comparação entre modelos.")
-            else:
-                var_comp_map = {"Rajada de vento": ("wind_gust_kmh", "km/h"), "Precipitação": ("precip_mm", "mm"), "CAPE": ("cape_jkg", "J/kg")}
-                coluna_comp, unidade_comp = var_comp_map[variavel_mapa]
-                st.caption(f"GFS · ICON · ECMWF — {variavel_mapa}, todas as 24h de {params['target_date']} (Brasília)")
-                horas_full = [f"{h:02d}:00" for h in range(24)]
-                tabela_comp = pd.DataFrame({"hora": horas_full}).set_index("hora")
-                for modelo_id, label in [("gfs_seamless", "GFS"), ("icon_seamless", "ICON"), ("ecmwf_ifs025", "ECMWF")]:
-                    d_modelo = dfs_base_comp.get(modelo_id)
-                    if d_modelo is None: continue
-                    sel = d_modelo[(d_modelo["estacao"] == unidade_focada["estacao"]) & (d_modelo["valid_time"].dt.date == pd.Timestamp(params["target_date"]).date())].copy()
-                    if sel.empty: continue
-                    sel["hora"] = sel["valid_time"].dt.strftime("%H:00")
-                    serie = sel.set_index("hora")[coluna_comp]
-                    if coluna_comp == "wind_gust_kmh": serie = serie * (1 + params["margin_pct"] / 100)
-                    tabela_comp[label] = serie
-                tabela_comp = tabela_comp.dropna(how="all")
-                if tabela_comp.empty: st.warning("Sem dados de comparação pra essa estação/dia.")
+if col_lado is not None:
+    with col_lado:
+        st.selectbox("📊 Unidade para comparar modelos (GFS · ICON · ECMWF)", ["— Nenhuma —"] + sorted(df_estacoes["estacao"].tolist(), key=lambda s: s.lower()), key="unidade_comparacao")
+        unidade_comp_nome = st.session_state.get("unidade_comparacao", "— Nenhuma —")
+        unidade_focada = None
+        if unidade_comp_nome != "— Nenhuma —":
+            linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_comp_nome]
+            if not linhas_foco.empty: unidade_focada = linhas_foco.iloc[0]
+
+        if unidade_focada is not None:
+            with st.container(border=True):
+                st.markdown(f"**📊 Comparação de modelos — {unidade_focada['nome']}**")
+                dfs_base_comp = st.session_state.get("dfs_base")
+                if not dfs_base_comp: st.info("Gere o mapa pelo menos uma vez pra ver a comparação entre modelos.")
                 else:
-                    st.line_chart(tabela_comp, height=220)
-                    st.caption(f"Valores em {unidade_comp}. Quanto mais os modelos concordam, maior a confiança.")
+                    var_comp_map = {"Rajada de vento": ("wind_gust_kmh", "km/h"), "Precipitação": ("precip_mm", "mm"), "CAPE": ("cape_jkg", "J/kg")}
+                    coluna_comp, unidade_comp = var_comp_map[variavel_mapa]
+                    st.caption(f"GFS · ICON · ECMWF — {variavel_mapa}, todas as 24h de {params['target_date']}")
+                    horas_full = [f"{h:02d}:00" for h in range(24)]
+                    tabela_comp = pd.DataFrame({"hora": horas_full}).set_index("hora")
+                    for modelo_id, label in [("gfs_seamless", "GFS"), ("icon_seamless", "ICON"), ("ecmwf_ifs025", "ECMWF")]:
+                        d_modelo = dfs_base_comp.get(modelo_id)
+                        if d_modelo is None: continue
+                        sel = d_modelo[(d_modelo["estacao"] == unidade_focada["estacao"]) & (d_modelo["valid_time"].dt.date == pd.Timestamp(params["target_date"]).date())].copy()
+                        if sel.empty: continue
+                        sel["hora"] = sel["valid_time"].dt.strftime("%H:00")
+                        serie = sel.set_index("hora")[coluna_comp]
+                        if coluna_comp == "wind_gust_kmh": serie = serie * (1 + params["margin_pct"] / 100)
+                        tabela_comp[label] = serie
+                    tabela_comp = tabela_comp.dropna(how="all")
+                    if tabela_comp.empty: st.warning("Sem dados de comparação pra essa estação/dia.")
+                    else:
+                        st.line_chart(tabela_comp, height=220)
+                        st.caption(f"Valores em {unidade_comp}. Quanto mais os modelos concordam, maior a confiança.")
 
-    tab_risco, tab_rank, tab_alertas, tab_raio, tab_contatos = st.tabs(["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📞 Contatos"])
+        tab_risco, tab_rank, tab_alertas, tab_raio, tab_contatos = st.tabs(["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📞 Contatos"])
 
-    with tab_risco:
-        em_risco = df_estacoes[df_estacoes["risco_score"] > 0].sort_values("risco_score", ascending=False)
-        if em_risco.empty: st.success("Nenhuma estação em risco médio/alto no momento.")
-        else:
-            for _, e in em_risco.iterrows(): st.markdown(f"{e['risco_emoji']} **{e['nome']}** — <span style='color:{e['risco_color']}'>{e['risco_label']}</span>", unsafe_allow_html=True)
+        with tab_risco:
+            em_risco = df_estacoes[df_estacoes["risco_score"] > 0].sort_values("risco_score", ascending=False)
+            if em_risco.empty: st.success("Nenhuma estação em risco médio/alto no momento.")
+            else:
+                for _, e in em_risco.iterrows(): st.markdown(f"{e['risco_emoji']} **{e['nome']}** — <span style='color:{e['risco_color']}'>{e['risco_label']}</span>", unsafe_allow_html=True)
 
-    with tab_rank:
-        st.markdown(f"**Top 6 — {variavel_mapa}**")
-        top6 = df_estacoes.sort_values(chave_var, ascending=False).head(6)[["nome", chave_var]]
-        top6.columns = ["Estação", unidade_var]
-        st.dataframe(top6, hide_index=True, use_container_width=True)
+        with tab_rank:
+            st.markdown(f"**Top 6 — {variavel_mapa}**")
+            top6 = df_estacoes.sort_values(chave_var, ascending=False).head(6)[["nome", chave_var]]
+            top6.columns = ["Estação", unidade_var]
+            st.dataframe(top6, hide_index=True, use_container_width=True)
 
-    with tab_alertas:
-        if not alertas: st.success("Nenhum alerta de previsão ativo.")
-        else:
-            for a in alertas:
-                with st.container(border=True):
-                    st.text(a["texto"])
-                    st.code(a["texto"], language=None)
+        with tab_alertas:
+            if not alertas: st.success("Nenhum alerta de previsão ativo.")
+            else:
+                for a in alertas:
+                    with st.container(border=True):
+                        st.text(a["texto"])
+                        st.code(a["texto"], language=None)
 
-    with tab_raio:
-        if incluir_raios:
-            ultima_att = st.session_state.get("ultima_atualizacao_raios")
-            if ultima_att is not None: st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')} (Brasília)** · janela de {raios_minutos} min · atualiza a cada {intervalo_raios_seg}s")
-        else: st.caption("Raios desativados na barra lateral.")
-        
-        if st.session_state.alertas_raio_ativos:
-            for a in st.session_state.alertas_raio_ativos:
-                with st.container(border=True):
-                    st.text(a["texto"])
-                    st.code(a["texto"], language=None)
-        else:
-            st.info("Nenhum alerta de raio próximo ativo.")
+        with tab_raio:
+            if incluir_raios:
+                ultima_att = st.session_state.get("ultima_atualizacao_raios")
+                if ultima_att is not None: st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')}** · janela de {raios_minutos} min · atualiza a cada {intervalo_raios_seg}s")
+            else: st.caption("Raios desativados na barra lateral.")
 
-    with tab_contatos:
-        nomes_unidades = sorted(CONTATOS_UNIDADES.keys(), key=lambda k: CONTATOS_UNIDADES[k]["nome"].lower())
-        escolha = st.selectbox("Unidade", nomes_unidades, format_func=lambda k: CONTATOS_UNIDADES[k]["nome"])
-        info = CONTATOS_UNIDADES[escolha]
-        st.markdown(f"**📞 {info['nome']}**")
-        for i, item in enumerate(info["numeros"], start=1):
-            linha = f"{i}. {item['numero']}"
-            if item.get("descricao"): linha += f"  _{item['descricao']}_"
-            st.markdown(linha)
+            if st.session_state.alertas_raio_ativos:
+                for a in st.session_state.alertas_raio_ativos:
+                    with st.container(border=True):
+                        st.text(a["texto"])
+                        st.code(a["texto"], language=None)
+            else:
+                st.info("Nenhum alerta de raio próximo ativo.")
+
+        with tab_contatos:
+            nomes_unidades = sorted(CONTATOS_UNIDADES.keys(), key=lambda k: CONTATOS_UNIDADES[k]["nome"].lower())
+            escolha = st.selectbox("Unidade", nomes_unidades, format_func=lambda k: CONTATOS_UNIDADES[k]["nome"])
+            info = CONTATOS_UNIDADES[escolha]
+            st.markdown(f"**📞 {info['nome']}**")
+            for i, item in enumerate(info["numeros"], start=1):
+                linha = f"{i}. {item['numero']}"
+                if item.get("descricao"): linha += f"  _{item['descricao']}_"
+                st.markdown(linha)
 
 st.divider()
 col_pdf, _ = st.columns([1, 3])
