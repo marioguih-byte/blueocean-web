@@ -985,67 +985,36 @@ window.addEventListener("load", function() {{
     m.get_root().html.add_child(folium.Element(busca_html))
 
     # --------------------------------------------------------------
-    # Botão pra retrair/mostrar os painéis laterais (Risco, Ranking,
-    # Alertas, Raios, Contatos, Previsão horária) sem recarregar nada
-    # — mexe só no CSS da página principal, igual o "«" da barra lateral
-    # esquerda nativa do Streamlit.
+    # Ponte pra abrir a previsão horária de uma unidade na aba lateral,
+    # sem navegar (o iframe não tem permissão pra navegar a página
+    # principal) — em vez disso, escreve direto no campo de texto
+    # escondido "bridge_unidade_previsao" e dispara os eventos que o
+    # Streamlit espera pra reconhecer a mudança e rodar de novo.
+    # IMPORTANTE: usa window.top (não window.parent) porque o Folium
+    # já embrulha o mapa no próprio iframe interno — window.parent
+    # aqui aponta só pra esse iframe intermediário, não pra página
+    # principal do Streamlit. window.top sempre é o nível mais alto,
+    # não importa quantos iframes existam no meio.
     # --------------------------------------------------------------
-    retrair_html = """
+    ponte_html = """
 <script>
-window.addEventListener("load", function() {
-    try {
-        var parentDoc = window.parent.document;
-        if (parentDoc.getElementById("toggle-painel-lateral-btn")) return;
-        var btn = parentDoc.createElement("button");
-        btn.id = "toggle-painel-lateral-btn";
-        btn.innerText = "» painéis";
-        btn.title = "Retrair/mostrar painéis laterais";
-        btn.style.cssText = "position:fixed; top:8px; right:14px; z-index:9999; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:6px; padding:5px 10px; cursor:pointer; font:12px sans-serif;";
-        parentDoc.body.appendChild(btn);
-        btn.addEventListener("click", function() {
-            var painel = parentDoc.querySelector(".st-key-painel_lateral");
-            if (!painel) return;
-            var coluna = painel.closest('[data-testid="stColumn"]');
-            if (!coluna) return;
-            var linha = coluna.parentElement;
-            var oculto = coluna.style.display === "none";
-            coluna.style.display = oculto ? "" : "none";
-            btn.innerText = oculto ? "» painéis" : "« painéis";
-            if (linha) {
-                linha.querySelectorAll('[data-testid="stColumn"]').forEach(function(c) {
-                    if (c !== coluna) {
-                        c.style.flex = oculto ? "" : "1 1 100%";
-                        c.style.width = oculto ? "" : "100%";
-                        c.style.maxWidth = oculto ? "" : "100%";
-                    }
-                });
-            }
-        });
-    } catch (e) {}
-});
-
-// Ponte pra abrir a previsão horária de uma unidade na aba lateral,
-// sem navegar (o iframe não tem permissão pra navegar a página
-// principal) — em vez disso, escreve direto no campo de texto
-// escondido "bridge_unidade_previsao" e dispara os eventos que o
-// Streamlit espera pra reconhecer a mudança e rodar de novo.
 window.blueoceanAbrirPrevisao = function(estacaoKey) {
     try {
-        var parentDoc = window.parent.document;
+        var topoDoc = window.top.document;
         var alvo = null;
-        parentDoc.querySelectorAll('input[type="text"]').forEach(function(inp) {
+        topoDoc.querySelectorAll('input[type="text"]').forEach(function(inp) {
             if (inp.getAttribute("aria-label") === "bridge_unidade_previsao") alvo = inp;
         });
         if (!alvo) return;
-        var setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, "value").set;
+        var setter = Object.getOwnPropertyDescriptor(window.top.HTMLInputElement.prototype, "value").set;
         setter.call(alvo, estacaoKey);
-        alvo.dispatchEvent(new window.parent.Event("input", { bubbles: true }));
+        alvo.dispatchEvent(new window.top.Event("input", { bubbles: true }));
         alvo.blur();
     } catch (e) {}
 };
 </script>
 """
-    m.get_root().html.add_child(folium.Element(retrair_html))
+    m.get_root().html.add_child(folium.Element(ponte_html))
 
     # JS que atualiza SÓ os raios (pontos + células de deslocamento),
     # lendo periodicamente static/raios_live.json — o resto do mapa
