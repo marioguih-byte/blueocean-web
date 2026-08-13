@@ -799,7 +799,11 @@ chave_dado_hora = {"Rajada de vento": "gusts", "Precipitação": "precip", "CAPE
 # horária" no pop-up de uma unidade. O Streamlit então reage a essa
 # mudança normalmente, como qualquer outro widget.
 # --------------------------------------------------------------
-st.markdown("<style>.st-key-ponte_previsao { display: none; }</style>", unsafe_allow_html=True)
+st.markdown(
+    "<style>.st-key-ponte_previsao { position: fixed !important; top: -1000px !important; "
+    "left: -1000px !important; width: 1px !important; height: 1px !important; overflow: hidden !important; }</style>",
+    unsafe_allow_html=True,
+)
 if st.session_state.pop("_limpar_previsao_flag", False):
     st.session_state["bridge_unidade_previsao"] = ""
 with st.container(key="ponte_previsao"):
