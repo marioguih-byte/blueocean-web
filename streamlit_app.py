@@ -47,7 +47,7 @@ if os.path.exists(_som_origem) and not os.path.exists(_som_destino):
 RAIOS_JSON_PATH = os.path.join(STATIC_DIR, "raios_live.json")
 
 
-def _escrever_raios_json(raios_df, celulas_com_trajetoria, atualizado_em_utc, alertas_unidade=None, erro=None):
+def _escrever_raios_json(raios_df, celulas_com_trajetoria, atualizado_em_utc, alertas_unidade=None, erro=None, intervalo_raios_seg=30):
     """Grava o estado atual dos raios num JSON estático que o JS do mapa
     fica lendo periodicamente. É isso que permite atualizar só os raios
     sem re-renderizar o mapa (e sem perder zoom / popups abertos)."""
@@ -72,12 +72,20 @@ def _escrever_raios_json(raios_df, celulas_com_trajetoria, atualizado_em_utc, al
             "rumo_texto": traj["rumo_texto"],
         })
     alertas_out = []
+    agora_ts = time.time()
+    # "novo" fica True só por uma janela curtinha (pouco mais que um ciclo
+    # de atualização) logo depois do Python decidir notificar. Isso é o
+    # que o JS usa pra saber se deve tocar som/abrir pop-up agora — como a
+    # decisão de verdade mora aqui (sobrevive à reconstrução do mapa), o
+    # som não repete toda vez que a página é recarregada por outro motivo.
+    janela_novo_seg = max(intervalo_raios_seg * 1.5, 20)
     for nome, a in (alertas_unidade or {}).items():
-        if a["expira_ts"] <= time.time(): continue
+        if a["expira_ts"] <= agora_ts: continue
         alertas_out.append({
             "estacao": nome,
             "nivel": a["nivel"],
             "notificado_ts": a["notificado_ts"],
+            "novo": (agora_ts - a["notificado_ts"]) < janela_novo_seg,
             "expira_brasilia": utc_para_brasilia(datetime.fromtimestamp(a["expira_ts"], tz=timezone.utc)).strftime("%H:%M:%S"),
         })
     payload = {
@@ -866,7 +874,7 @@ def _atualizar_dados_raios():
     st.session_state["_fragment_raios_df"] = raios_df
     st.session_state["_fragment_celulas"] = celulas_com_trajetoria
 
-    _escrever_raios_json(raios_df, celulas_com_trajetoria, st.session_state.get("ultima_atualizacao_raios"), st.session_state.alertas_unidade, erro)
+    _escrever_raios_json(raios_df, celulas_com_trajetoria, st.session_state.get("ultima_atualizacao_raios"), st.session_state.alertas_unidade, erro, intervalo_raios_seg)
 
     if st.session_state.get("dialog_raio_texto"): _dialog_alerta_raio()
 
@@ -1006,9 +1014,9 @@ window.blueoceanAbrirPrevisao = function(estacaoKey) {
             if (inp.getAttribute("aria-label") === "bridge_unidade_previsao") alvo = inp;
         });
         if (!alvo) return;
-        var setter = Object.getOwnPropertyDescriptor(window.top.HTMLInputElement.prototype, "value").set;
-        setter.call(alvo, estacaoKey);
-        alvo.dispatchEvent(new window.top.Event("input", { bubbles: true }));
+        alvo.focus();
+        alvo.select();
+        topoDoc.execCommand("insertText", false, estacaoKey);
         alvo.blur();
     } catch (e) {}
 };
@@ -1074,15 +1082,17 @@ window.addEventListener("load", function() {{
     }}
 
     function checarPerigo(alertas) {{
-        // O Python já calculou distância, nível (vermelho <=30km / amarelo
-        // <=50km) e a janela de 1h — aqui só decide se é uma notificação
-        // NOVA (primeira vez ou renovada após 1h) usando notificado_ts,
-        // pra não repetir som/pop-up toda vez que o mapa é reconstruído.
+        // O Python é quem decide de verdade se uma notificação é NOVA
+        // (campo "novo", só fica true por uma janela curtinha logo após
+        // decidir notificar) — essa decisão sobrevive à reconstrução do
+        // mapa, que é quando a memória local (vistosNotificacao) se perde.
+        // vistosNotificacao aqui serve só pra não tocar o som 2x caso o
+        // JS dê poll mais de uma vez dentro dessa mesma janela curta.
         (alertas || []).forEach(function(a) {{
+            if (!a.novo) return;
             var jaVisto = vistosNotificacao[a.estacao];
-            var ehNova = jaVisto === undefined || jaVisto !== a.notificado_ts;
+            if (jaVisto === a.notificado_ts) return;
             vistosNotificacao[a.estacao] = a.notificado_ts;
-            if (!ehNova) return;
 
             if (cfg.tocarSom) {{
                 var nomeVar = cfg.marcadores[a.estacao];
