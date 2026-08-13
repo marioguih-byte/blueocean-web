@@ -18,7 +18,6 @@ import pandas as pd
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
-from streamlit_autorefresh import st_autorefresh
 from streamlit_folium import st_folium
 from urllib3.util.retry import Retry
 
@@ -306,10 +305,11 @@ CAPE_LABELS = ["Instabilidade fraca", "Instabilidade moderada", "Instabilidade f
                "Instabilidade muito forte", "Instabilidade extrema"]
 
 ALERTA_CAPE_MIN_JKG_PADRAO = 2500
-TIMEZONE_OFFSET_HOURS = -3
+TIMEZONE_OFFSET_HOURS = 0  # dados já vêm no horário de Brasília direto da Open-Meteo (timezone=America/Sao_Paulo)
 GLM_BUCKET = "noaa-goes19"
 GLM_BASE_URL = f"https://{GLM_BUCKET}.s3.amazonaws.com"
-SOUTH_AMERICA_BOUNDS = {"lat_min": -58.0, "lat_max": 13.5, "lon_min": -82.0, "lon_max": -33.0}
+SOUTH_AMERICA_BOUNDS = {"lat_min": -58.0, "lat_max": 13.5, "lon_min": -82.0, "lon_max": -33.0}  # usado só pra buscar raios
+BRAZIL_BOUNDS = {"lat_min": -34.0, "lat_max": 5.5, "lon_min": -74.5, "lon_max": -32.0}  # usado pra limitar o mapa
 
 
 def classify_index(v, thresholds):
@@ -336,6 +336,12 @@ def cape_color_hex(v):
 
 def _hora_local(t):
     return int((t.hour + TIMEZONE_OFFSET_HOURS) % 24)
+
+
+def utc_para_brasilia(dt_utc):
+    """Converte um datetime em UTC (usado pelos dados de raios/GLM, que
+    vêm direto do satélite) pra horário de Brasília (UTC-3)."""
+    return dt_utc - timedelta(hours=3)
 
 
 def classificar_periodo(h):
@@ -391,15 +397,15 @@ def montar_mensagem_alerta_cape(nome, periodos_texto, cape_max):
 
 
 def montar_mensagem_proximidade_raio(nivel, nome_estacao, meteorologista):
-    agora = datetime.now()
+    agora = utc_para_brasilia(datetime.now(timezone.utc))
     validade = agora + timedelta(hours=1)
     janela = "-15 min até o momento" if nivel == 30 else "-30 min até o momento"
     emoji = "🔴" if nivel == 30 else "🟡"
-    return (f"{emoji} {agora.strftime('%d/%m/%Y')} - {agora.strftime('%H:%M')}\n"
+    return (f"{emoji} {agora.strftime('%d/%m/%Y')} - {agora.strftime('%H:%M')} (Brasília)\n"
             f"* Local: {nome_estacao}\n"
             f"* Meteorologista: {meteorologista or '(não informado)'}\n"
             f"* Raios próximos de sua região ({janela})\n"
-            f"Válido até as {validade.strftime('%H:%M')}")
+            f"Válido até as {validade.strftime('%H:%M')} (Brasília)")
 
 
 RISCO_NIVEIS = [
@@ -493,7 +499,7 @@ def fetch_openmeteo_full_hourly(df_json, model, target_date, batch_size=40):
             "latitude": ",".join(f"{v:.5f}" for v in batch["lat"]),
             "longitude": ",".join(f"{v:.5f}" for v in batch["lon"]),
             "hourly": "wind_gusts_10m,wind_speed_10m,wind_direction_10m,precipitation,cape",
-            "models": model, "timezone": "UTC", "past_days": past_days, "forecast_days": forecast_days,
+            "models": model, "timezone": "America/Sao_Paulo", "past_days": past_days, "forecast_days": forecast_days,
         }
         if api_key:
             params["apikey"] = api_key
@@ -939,7 +945,7 @@ with st.sidebar:
     st.subheader("📅 Data e horários")
     target_date = st.date_input("Data da previsão", value=datetime.now().date())
     todas_horas = [f"{h:02d}" for h in range(24)]
-    horas_selecionadas = st.multiselect("Horários (UTC) a incluir", todas_horas, default=todas_horas)
+    horas_selecionadas = st.multiselect("Horários (horário de Brasília) a incluir", todas_horas, default=todas_horas)
 
     st.subheader("🌬 Modelos")
     modelos_valores = ["gfs_seamless", "icon_seamless", "ecmwf_ifs025", "ensemble"]
@@ -972,7 +978,7 @@ with st.sidebar:
     modo_horario = st.radio("Modo de exibição", ["Resumo do dia (acumulado)", "Hora específica"], horizontal=False)
     hora_especifica = None
     if modo_horario == "Hora específica" and horas_selecionadas:
-        hora_especifica = st.select_slider("Horário (UTC)", options=sorted(horas_selecionadas), value=sorted(horas_selecionadas)[0])
+        hora_especifica = st.select_slider("Horário (Brasília)", options=sorted(horas_selecionadas), value=sorted(horas_selecionadas)[0])
 
     gerar = st.button("🌍 Gerar / Atualizar mapa", type="primary", use_container_width=True)
 
@@ -1024,51 +1030,6 @@ if df_estacoes.empty:
     st.warning("Nenhum dado horário disponível pra essa combinação de data/horários.")
     st.stop()
 
-# --------- raios (opcional) ---------
-raios_df = pd.DataFrame()
-celulas_com_trajetoria = []
-if incluir_raios:
-    st_autorefresh(interval=120_000, key="raios_autorefresh_timer")  # atualiza sozinho a cada 2 min
-
-    try:
-        raios_df = fetch_glm_flashes_recent(minutos=raios_minutos)
-        st.session_state.ultima_atualizacao_raios = datetime.now(timezone.utc)
-        st.session_state.ultimo_erro_raios = None
-    except Exception as e:
-        st.session_state.ultimo_erro_raios = str(e)
-
-    if mostrar_deslocamento and not raios_df.empty:
-        grupos = clusterizar_raios(raios_df)
-        agora_ts = time.time()
-        celulas = atualizar_celulas_raio(grupos, agora_ts)
-        for cel in celulas:
-            traj = calcular_trajetoria_celula(cel)
-            if traj is not None:
-                celulas_com_trajetoria.append({**cel, "trajetoria": traj})
-
-    if not raios_df.empty:
-        for _, raio in raios_df.iterrows():
-            for _, est in df_estacoes.iterrows():
-                dist = ((raio["lat"] - est["lat"]) ** 2 + (raio["lon"] - est["lon"]) ** 2) ** 0.5 * 111
-                for nivel in (30, 50):
-                    if dist > nivel:
-                        continue
-                    chave_alerta = f"{est['nome']}_{nivel}"
-                    ultimo = st.session_state.alertas_raio_disparados.get(chave_alerta, 0)
-                    if time.time() - ultimo < 3600:
-                        continue
-                    st.session_state.alertas_raio_disparados[chave_alerta] = time.time()
-                    texto = montar_mensagem_proximidade_raio(nivel, est["nome"], params["meteorologista"])
-                    st.session_state.alertas_raio_ativos.insert(0, {"texto": texto, "estacao": est["nome"], "expira": time.time() + 3600})
-                    if tocar_som:
-                        st.session_state["_tocar_beep"] = True
-
-st.session_state.alertas_raio_ativos = [a for a in st.session_state.alertas_raio_ativos if a["expira"] > time.time()]
-
-if st.session_state.get("_tocar_beep"):
-    st.audio("data/alerta_raio.wav", autoplay=True)
-    st.session_state["_tocar_beep"] = False
-
 # ======================================================================
 # LAYOUT — mapa + painéis
 # ======================================================================
@@ -1080,37 +1041,102 @@ chave_var, color_fn, unidade_var = var_map[variavel_mapa]
 
 chave_dado_hora = {"Rajada de vento": "gusts", "Precipitação": "precip", "CAPE": "capes"}[variavel_mapa]
 
-with col_mapa:
+unidade_focada = None
+if unidade_selecionada != "— Nenhuma (ver tudo) —":
+    linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_selecionada]
+    if not linhas_foco.empty:
+        unidade_focada = linhas_foco.iloc[0]
+
+
+@st.dialog("⚡ Raio próximo de uma unidade!")
+def _dialog_alerta_raio():
+    texto = st.session_state.get("dialog_raio_texto")
+    if not texto:
+        return
+    st.warning("Foi detectado um raio próximo de uma unidade monitorada. Copie a mensagem abaixo:")
+    st.code(texto, language=None)
+    if st.button("Fechar", use_container_width=True, type="primary"):
+        st.session_state.dialog_raio_texto = None
+        st.rerun()
+
+
+def _corpo_mapa_e_raios():
+    # --------- raios (opcional) — só esta parte se atualiza sozinha ---------
+    raios_df = pd.DataFrame()
+    celulas_com_trajetoria = []
+    if incluir_raios:
+        try:
+            raios_df = fetch_glm_flashes_recent(minutos=raios_minutos)
+            st.session_state.ultima_atualizacao_raios = datetime.now(timezone.utc)
+            st.session_state.ultimo_erro_raios = None
+        except Exception as e:
+            st.session_state.ultimo_erro_raios = str(e)
+
+        if mostrar_deslocamento and not raios_df.empty:
+            grupos = clusterizar_raios(raios_df)
+            agora_ts = time.time()
+            celulas = atualizar_celulas_raio(grupos, agora_ts)
+            for cel in celulas:
+                traj = calcular_trajetoria_celula(cel)
+                if traj is not None:
+                    celulas_com_trajetoria.append({**cel, "trajetoria": traj})
+
+        if not raios_df.empty:
+            for _, raio in raios_df.iterrows():
+                for _, est in df_estacoes.iterrows():
+                    dist = ((raio["lat"] - est["lat"]) ** 2 + (raio["lon"] - est["lon"]) ** 2) ** 0.5 * 111
+                    for nivel in (30, 50):
+                        if dist > nivel:
+                            continue
+                        chave_alerta = f"{est['nome']}_{nivel}"
+                        ultimo = st.session_state.alertas_raio_disparados.get(chave_alerta, 0)
+                        if time.time() - ultimo < 3600:
+                            continue
+                        st.session_state.alertas_raio_disparados[chave_alerta] = time.time()
+                        texto = montar_mensagem_proximidade_raio(nivel, est["nome"], params["meteorologista"])
+                        st.session_state.alertas_raio_ativos.insert(0, {"texto": texto, "estacao": est["nome"], "expira": time.time() + 3600})
+                        st.session_state.dialog_raio_texto = texto
+                        if tocar_som:
+                            st.session_state["_tocar_beep"] = True
+
+    st.session_state.alertas_raio_ativos = [a for a in st.session_state.alertas_raio_ativos if a["expira"] > time.time()]
+
+    if st.session_state.get("_tocar_beep"):
+        st.audio("data/alerta_raio.wav", autoplay=True)
+        st.session_state["_tocar_beep"] = False
+
+    # o popup só reaparece se ainda não foi fechado (mesmo em atualizações automáticas seguintes)
+    if st.session_state.get("dialog_raio_texto"):
+        _dialog_alerta_raio()
+
     if hora_especifica:
-        st.caption(f"🕐 Mostrando previsão pontual das **{hora_especifica}:00 UTC** — {variavel_mapa}")
+        st.caption(f"🕐 Mostrando previsão pontual das **{hora_especifica}:00 (Brasília)** — {variavel_mapa}")
     else:
         st.caption(f"📊 Mostrando o **resumo acumulado do dia** — {variavel_mapa}")
 
     if incluir_raios:
         ultima_att = st.session_state.get("ultima_atualizacao_raios")
         if ultima_att is not None:
-            hora_utc = ultima_att.strftime("%H:%M:%S")
-            hora_local = (ultima_att - timedelta(hours=3)).strftime("%H:%M:%S")
-            st.info(f"⚡ **Raios (GLM/GOES-19) atualizados às {hora_utc} UTC** (≈ {hora_local} em Brasília) · "
+            hora_brasilia = utc_para_brasilia(ultima_att).strftime("%H:%M:%S")
+            st.info(f"⚡ **Raios (GLM/GOES-19) atualizados às {hora_brasilia} (Brasília)** · "
                     f"atualiza sozinho a cada 2 minutos", icon="🕐")
         erro_raios = st.session_state.get("ultimo_erro_raios")
         if erro_raios:
             st.warning(f"GLM indisponível no momento: {erro_raios}")
 
-    unidade_focada = None
-    if unidade_selecionada != "— Nenhuma (ver tudo) —":
-        linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_selecionada]
-        if not linhas_foco.empty:
-            unidade_focada = linhas_foco.iloc[0]
-
+    bb = BRAZIL_BOUNDS
     if unidade_focada is not None:
         m = folium.Map(location=[unidade_focada["lat"], unidade_focada["lon"]], zoom_start=10,
-                        tiles="CartoDB dark_matter", control_scale=True)
+                        tiles="CartoDB dark_matter", control_scale=True,
+                        min_lat=bb["lat_min"], max_lat=bb["lat_max"], min_lon=bb["lon_min"], max_lon=bb["lon_max"],
+                        max_bounds=True, min_zoom=4, max_zoom=14, maxBoundsViscosity=1.0)
     else:
-        center_lat = (bbox["lat_min"] + bbox["lat_max"]) / 2
-        center_lon = (bbox["lon_min"] + bbox["lon_max"]) / 2
-        m = folium.Map(location=[center_lat, center_lon], tiles="CartoDB dark_matter", control_scale=True)
-        m.fit_bounds([[bbox["lat_min"], bbox["lon_min"]], [bbox["lat_max"], bbox["lon_max"]]])
+        center_lat = (bb["lat_min"] + bb["lat_max"]) / 2
+        center_lon = (bb["lon_min"] + bb["lon_max"]) / 2
+        m = folium.Map(location=[center_lat, center_lon], tiles="CartoDB dark_matter", control_scale=True,
+                        min_lat=bb["lat_min"], max_lat=bb["lat_max"], min_lon=bb["lon_min"], max_lon=bb["lon_max"],
+                        max_bounds=True, min_zoom=4, max_zoom=14, maxBoundsViscosity=1.0)
+        m.fit_bounds([[bb["lat_min"], bb["lon_min"]], [bb["lat_max"], bb["lon_max"]]])
 
     aneis_fg = folium.FeatureGroup(name="📏 Raios de alerta ao redor das unidades", show=mostrar_aneis)
 
@@ -1131,7 +1157,7 @@ with col_mapa:
 
         popup_html = (f"<b>{e['risco_emoji']} {e['nome']}</b><br/>"
                       f"Risco combinado: <b style='color:{e['risco_color']}'>{e['risco_label']}</b><br/>"
-                      f"{variavel_mapa} {'às ' + hora_especifica + ':00 UTC' if hora_especifica else '(resumo do dia)'}: "
+                      f"{variavel_mapa} {'às ' + hora_especifica + ':00 (Brasília)' if hora_especifica else '(resumo do dia)'}: "
                       f"<b>{texto_valor}</b><br/><hr/>"
                       f"Rajada máx. do dia: {e['max_gust']:.0f} km/h<br/>"
                       f"Chuva acum. do dia: {e['soma_precip']:.1f} mm<br/>"
@@ -1146,7 +1172,6 @@ with col_mapa:
 
         eh_unidade_focada = unidade_focada is not None and e["estacao"] == unidade_focada["estacao"]
         if eh_unidade_focada:
-            # anel pulsante em volta da unidade selecionada, pra destacar no mapa
             folium.CircleMarker(location=[e["lat"], e["lon"]], radius=16, color="#3fc2c2", weight=2,
                                  fill=False, opacity=0.9, dash_array="4, 4").add_to(m)
         folium.CircleMarker(
@@ -1173,9 +1198,10 @@ with col_mapa:
             idade_min = max((agora - raio["time"]).total_seconds() / 60, 0) if pd.notna(raio["time"]) else 0
             fracao = min(idade_min / max(raios_minutos, 1), 1)
             cor = "#ff2828" if fracao < 0.33 else ("#f97316" if fracao < 0.66 else "#eab308")
+            hora_raio_brasilia = utc_para_brasilia(raio["time"]).strftime("%H:%M:%S") if pd.notna(raio["time"]) else "?"
             folium.CircleMarker(location=[raio["lat"], raio["lon"]], radius=3, color=cor, weight=1,
                                  fill=True, fill_color=cor, fill_opacity=0.8,
-                                 tooltip=f"⚡ ~{idade_min:.0f} min atrás").add_to(m)
+                                 tooltip=f"⚡ {hora_raio_brasilia} (Brasília) · ~{idade_min:.0f} min atrás").add_to(m)
 
     if mostrar_deslocamento and celulas_com_trajetoria:
         deslocamento_fg = folium.FeatureGroup(name="🌀 Deslocamento das células de tempestade", show=True)
@@ -1187,7 +1213,6 @@ with col_mapa:
             pontos_linha = [[p["lat"], p["lon"]] for p in hist] + [[c["lat"], c["lon"]] for c in traj["checkpoints"]]
             folium.PolyLine(pontos_linha, color="#e5e7eb", weight=1.5, opacity=0.55, dash_array="6, 5").add_to(deslocamento_fg)
 
-            # histórico da célula — "X" colorido do mais antigo (vermelho) ao mais recente (verde)
             for i, p in enumerate(hist):
                 fracao = i / (n - 1) if n > 1 else 1
                 if fracao <= 0.5:
@@ -1207,23 +1232,72 @@ with col_mapa:
                         f"Célula #{cel['id']} · {p['n']} raios · ~{traj['vel_kmh']:.0f} km/h para {traj['rumo_texto']}"))
                 marcador.add_to(deslocamento_fg)
 
-            # posições futuras projetadas (+30/+60/+90 min)
             for idx_c, c in enumerate(traj["checkpoints"]):
                 opacidade = max(0.75 - idx_c * 0.18, 0.2)
-                hora_estim = (datetime.now(timezone.utc) + timedelta(minutes=c["min"])).strftime("%H:%M")
+                hora_estim = utc_para_brasilia(datetime.now(timezone.utc) + timedelta(minutes=c["min"])).strftime("%H:%M")
                 folium.CircleMarker(
                     location=[c["lat"], c["lon"]], radius=3.5, color="#e5e7eb", weight=1,
                     fill=True, fill_color="#e5e7eb", fill_opacity=opacidade, opacity=opacidade,
-                    tooltip=f"Célula #{cel['id']} — alcance estimado em +{c['min']} min (~{hora_estim} UTC)",
+                    tooltip=f"Célula #{cel['id']} — alcance estimado em +{c['min']} min (~{hora_estim} Brasília)",
                 ).add_to(deslocamento_fg)
         deslocamento_fg.add_to(m)
 
     folium.LayerControl(collapsed=True).add_to(m)
-    st_folium(m, height=620, use_container_width=True, returned_objects=[])
+    st_folium(m, height=620, use_container_width=True, returned_objects=[], key="mapa_principal")
+
+    return raios_df, celulas_com_trajetoria
+
+
+# só a parte de raios+mapa se atualiza sozinha a cada 2 min; o resto da
+# página (abas, comparação de modelos etc.) não é afetado
+if incluir_raios:
+    mapa_fragment = st.fragment(run_every="2m")(_corpo_mapa_e_raios)
+else:
+    mapa_fragment = st.fragment(_corpo_mapa_e_raios)
+
+with col_mapa:
+    _resultado_fragment = mapa_fragment()
+
+raios_df, celulas_com_trajetoria = _resultado_fragment if _resultado_fragment else (pd.DataFrame(), [])
 
 with col_lado:
-    tab_risco, tab_rank, tab_alertas, tab_raio, tab_comp, tab_contatos = st.tabs(
-        ["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📊 Comparar modelos", "📞 Contatos"])
+    if unidade_focada is not None:
+        with st.container(border=True):
+            st.markdown(f"**📊 Comparação de modelos — {unidade_focada['nome']}**")
+            dfs_base_comp = st.session_state.get("dfs_base")
+            if not dfs_base_comp:
+                st.info("Gere o mapa pelo menos uma vez pra ver a comparação entre modelos.")
+            else:
+                var_comp_map = {"Rajada de vento": ("wind_gust_kmh", "km/h"), "Precipitação": ("precip_mm", "mm"),
+                                 "CAPE": ("cape_jkg", "J/kg")}
+                coluna_comp, unidade_comp = var_comp_map[variavel_mapa]
+                st.caption(f"GFS · ICON · ECMWF — {variavel_mapa}, todas as 24h de {params['target_date']} (Brasília)")
+
+                horas_full = [f"{h:02d}:00" for h in range(24)]
+                tabela_comp = pd.DataFrame({"hora": horas_full}).set_index("hora")
+                for modelo_id, label in [("gfs_seamless", "GFS"), ("icon_seamless", "ICON"), ("ecmwf_ifs025", "ECMWF")]:
+                    d_modelo = dfs_base_comp.get(modelo_id)
+                    if d_modelo is None:
+                        continue
+                    sel = d_modelo[(d_modelo["estacao"] == unidade_focada["estacao"]) &
+                                   (d_modelo["valid_time"].dt.date == pd.Timestamp(params["target_date"]).date())].copy()
+                    if sel.empty:
+                        continue
+                    sel["hora"] = sel["valid_time"].dt.strftime("%H:00")
+                    serie = sel.set_index("hora")[coluna_comp]
+                    if coluna_comp == "wind_gust_kmh":
+                        serie = serie * (1 + params["margin_pct"] / 100)
+                    tabela_comp[label] = serie
+
+                tabela_comp = tabela_comp.dropna(how="all")
+                if tabela_comp.empty:
+                    st.warning("Sem dados de comparação pra essa estação/dia.")
+                else:
+                    st.line_chart(tabela_comp, height=220)
+                    st.caption(f"Valores em {unidade_comp}. Quanto mais os modelos concordam, maior a confiança.")
+
+    tab_risco, tab_rank, tab_alertas, tab_raio, tab_contatos = st.tabs(
+        ["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📞 Contatos"])
 
     with tab_risco:
         em_risco = df_estacoes[df_estacoes["risco_score"] > 0].sort_values("risco_score", ascending=False)
@@ -1252,7 +1326,7 @@ with col_lado:
         if incluir_raios:
             ultima_att = st.session_state.get("ultima_atualizacao_raios")
             if ultima_att is not None:
-                st.caption(f"🕐 Última atualização: **{ultima_att.strftime('%H:%M:%S')} UTC** · "
+                st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')} (Brasília)** · "
                            f"janela de {raios_minutos} min · atualiza a cada 2 min")
             if celulas_com_trajetoria:
                 st.markdown(f"**{len(celulas_com_trajetoria)} célula(s) de tempestade em deslocamento:**")
@@ -1269,43 +1343,6 @@ with col_lado:
                     st.code(a["texto"], language=None)
         else:
             st.info("Nenhum alerta de raio próximo ativo.")
-
-    with tab_comp:
-        dfs_base_comp = st.session_state.get("dfs_base")
-        if not dfs_base_comp:
-            st.info("Gere o mapa pelo menos uma vez pra ver a comparação entre modelos.")
-        else:
-            nomes_estacoes_comp = df_estacoes["estacao"].tolist()
-            indice_padrao = nomes_estacoes_comp.index(unidade_focada["estacao"]) if unidade_focada is not None and unidade_focada["estacao"] in nomes_estacoes_comp else 0
-            estacao_escolhida = st.selectbox("Estação", nomes_estacoes_comp, index=indice_padrao,
-                                              format_func=lambda s: s.split(" - ")[0])
-            var_comp_map = {"Rajada de vento": ("wind_gust_kmh", "km/h"), "Precipitação": ("precip_mm", "mm"),
-                             "CAPE": ("cape_jkg", "J/kg")}
-            coluna_comp, unidade_comp = var_comp_map[variavel_mapa]
-            st.caption(f"Comparando GFS · ICON · ECMWF — {variavel_mapa}, todas as 24h de {params['target_date']}")
-
-            horas_full = [f"{h:02d}:00" for h in range(24)]
-            tabela_comp = pd.DataFrame({"hora": horas_full}).set_index("hora")
-            for modelo_id, label in [("gfs_seamless", "GFS"), ("icon_seamless", "ICON"), ("ecmwf_ifs025", "ECMWF")]:
-                d_modelo = dfs_base_comp.get(modelo_id)
-                if d_modelo is None:
-                    continue
-                sel = d_modelo[(d_modelo["estacao"] == estacao_escolhida) &
-                               (d_modelo["valid_time"].dt.date == pd.Timestamp(params["target_date"]).date())].copy()
-                if sel.empty:
-                    continue
-                sel["hora"] = sel["valid_time"].dt.strftime("%H:00")
-                serie = sel.set_index("hora")[coluna_comp]
-                if coluna_comp == "wind_gust_kmh":
-                    serie = serie * (1 + params["margin_pct"] / 100)
-                tabela_comp[label] = serie
-
-            tabela_comp = tabela_comp.dropna(how="all")
-            if tabela_comp.empty:
-                st.warning("Sem dados de comparação pra essa estação/dia.")
-            else:
-                st.line_chart(tabela_comp, height=280)
-                st.caption(f"Valores em {unidade_comp}. Quanto mais os modelos concordam, maior a confiança na previsão.")
 
     with tab_contatos:
         nomes_unidades = sorted(CONTATOS_UNIDADES.keys(), key=lambda k: CONTATOS_UNIDADES[k]["nome"].lower())
