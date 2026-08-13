@@ -4,6 +4,7 @@
 # ======================================================================
 import io
 import json
+import math
 import re
 import time
 import unicodedata
@@ -17,6 +18,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
+from streamlit_autorefresh import st_autorefresh
 from streamlit_folium import st_folium
 from urllib3.util.retry import Retry
 
@@ -230,6 +232,57 @@ def buscar_contatos_por_estacao(nome_estacao):
                 if len(pc) > melhor_qtd:
                     melhor_palavras, melhor_qtd = info, len(pc)
     return melhor_substring or melhor_palavras
+
+
+# ======================================================================
+# ESTAÇÕES — planilha embutida (LAT_E_LON_ESTAÇÕES_PBR.xlsx), sem
+# precisar de upload. Pra atualizar a lista, é só editar esta constante.
+# ======================================================================
+ESTACOES_PADRAO = [
+    {"estacao": "UTE Termocamaçari - UTE TCA", "lat": -12.66687, "lon": -38.31469},
+    {"estacao": "UTE Termobahia - UTE TBA", "lat": -12.70324, "lon": -38.5649},
+    {"estacao": "UTE Termoceará - UTE TCE", "lat": -3.69246, "lon": -38.87061},
+    {"estacao": "UTE Vale do Açu - UTE VLA", "lat": -5.38169, "lon": -36.81975},
+    {"estacao": "Refinaria Abreu e Lima - RNEST", "lat": -8.37966, "lon": -35.0102},
+    {"estacao": "Unidade de Tratamento de Gás Sul Capixaba - UTGSUL", "lat": -20.79446, "lon": -40.62091},
+    {"estacao": "Unidade de Tratamento de Gás de Cacimbas - UTGC", "lat": -19.4631, "lon": -39.7606},
+    {"estacao": "Refinaria Duque de Caxias - REDUC", "lat": -22.7151, "lon": -43.28401},
+    {"estacao": "UTE Termorio - UTE TRI", "lat": -22.71488, "lon": -43.25435},
+    {"estacao": "BOAVENTURA, Itaboraí-RJ", "lat": -22.66071, "lon": -42.85363},
+    {"estacao": "Unidade de Tratamento de Gás de Cabiúnas - UTGCAB", "lat": -22.28533, "lon": -41.71791},
+    {"estacao": "UTE Termomacaé - UTE TMA", "lat": -22.30616, "lon": -41.8767},
+    {"estacao": "UTE Seropédica/Baixada Fluminense - UTE SRP/BF", "lat": -22.72329, "lon": -43.64772},
+    {"estacao": "Refinaria Gabriel Passos - REGAP", "lat": -19.96428, "lon": -44.09514},
+    {"estacao": "UTE Ibirité - UTE IBT", "lat": -19.98858, "lon": -44.09821},
+    {"estacao": "UTE Juiz de Fora - UTE JF", "lat": -21.69062, "lon": -43.45672},
+    {"estacao": "UTE Três Lagoas - UTE TLG", "lat": -20.7455, "lon": -51.66459},
+    {"estacao": "Unidade de Tratamento de Gás de Caraguatatuba - UTGCA", "lat": -23.65419, "lon": -45.50121},
+    {"estacao": "Refinaria Presidente Bernardes - RPBC", "lat": -23.87333, "lon": -46.42757},
+    {"estacao": "UTE Cubatão - UTE CBT", "lat": -23.87573, "lon": -46.43139},
+    {"estacao": "Refinaria Henrique Lage - REVAP", "lat": -23.1848, "lon": -45.81581},
+    {"estacao": "Refinaria de Capuava - RECAP", "lat": -23.65668, "lon": -46.48088},
+    {"estacao": "Refinaria de Paulínia - REPLAN", "lat": -22.72959, "lon": -47.14771},
+    {"estacao": "UTE Nova Piratininga - UTE NPI", "lat": -23.69941, "lon": -46.67388},
+    {"estacao": "Refinaria Presidente Getúlio Vargas - REPAR", "lat": -25.56614, "lon": -49.36942},
+    {"estacao": "Refinaria Alberto Pasqualini - REFAP", "lat": -29.8699, "lon": -51.17819},
+    {"estacao": "UTE Canoas - UTE CAN", "lat": -29.87507, "lon": -51.14544},
+    {"estacao": "Armazém Rio de Janeiro", "lat": -22.81097, "lon": -43.28188},
+    {"estacao": "CILEP - CENPES", "lat": -22.8542, "lon": -43.23383},
+    {"estacao": "Porto Baia de Guanabara", "lat": -22.87894, "lon": -43.20933},
+    {"estacao": "ARM Macaé - Armazém Macaé", "lat": -22.41532, "lon": -41.86135},
+    {"estacao": "Porto de Imbetiba - Macaé", "lat": -22.38683, "lon": -41.76874},
+    {"estacao": "Porto Açu", "lat": -21.86474, "lon": -41.01644},
+    {"estacao": "Porto Aratu", "lat": -12.78013, "lon": -38.49676},
+    {"estacao": "Porto TMIB", "lat": -10.82413, "lon": -36.9463},
+    {"estacao": "Porto Belém", "lat": -1.4399, "lon": -48.49492},
+    {"estacao": "Porto Valença", "lat": -13.36937, "lon": -39.07125},
+    {"estacao": "Porto Guamaré", "lat": -5.10669, "lon": -36.31959},
+    {"estacao": "Porto Mucuripe", "lat": -3.71312, "lon": -38.47404},
+    {"estacao": "Porto Paracuru", "lat": -3.40115, "lon": -39.0109},
+]
+
+# raios de alerta ao redor de cada unidade, exibidos como anéis pontilhados no mapa
+RAIOS_ALERTA_KM = [(30, "#3b82f6"), (50, "#22c55e"), (100, "#f97316"), (150, "#ef4444"), (200, "#991b1b")]
 
 
 # ======================================================================
@@ -560,6 +613,156 @@ def fetch_glm_flashes_recent(minutos=15):
 
 
 # ======================================================================
+# DESLOCAMENTO DAS CÉLULAS DE TEMPESTADE — clusteriza os raios em
+# "células", acompanha o deslocamento de cada uma entre atualizações e
+# projeta a posição futura, igual ao app desktop original (lá isso era
+# feito em JS no navegador; aqui é feito em Python, entre uma
+# atualização automática e outra, e guardado em st.session_state pra
+# manter o histórico entre execuções).
+# ======================================================================
+def _dist_km(lat1, lon1, lat2, lon2):
+    dlat = (lat1 - lat2) * 111
+    latm = (lat1 + lat2) / 2
+    dlon = (lon1 - lon2) * 111 * math.cos(math.radians(latm))
+    return math.hypot(dlat, dlon)
+
+
+def _bearing_graus(lat1, lon1, lat2, lon2):
+    lat1r, lon1r, lat2r, lon2r = map(math.radians, (lat1, lon1, lat2, lon2))
+    dlon = lon2r - lon1r
+    y = math.sin(dlon) * math.cos(lat2r)
+    x = math.cos(lat1r) * math.sin(lat2r) - math.sin(lat1r) * math.cos(lat2r) * math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def _bearing_para_rumo(deg):
+    rumos = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return rumos[round(deg / 45) % 8]
+
+
+def _destino_ponto(lat, lon, bearing_deg, dist_km):
+    R = 6371
+    lat1, lon1, brng = math.radians(lat), math.radians(lon), math.radians(bearing_deg)
+    lat2 = math.asin(math.sin(lat1) * math.cos(dist_km / R) + math.cos(lat1) * math.sin(dist_km / R) * math.cos(brng))
+    lon2 = lon1 + math.atan2(math.sin(brng) * math.sin(dist_km / R) * math.cos(lat1),
+                              math.cos(dist_km / R) - math.sin(lat1) * math.sin(lat2))
+    return math.degrees(lat2), math.degrees(lon2)
+
+
+def clusterizar_raios(raios_df, dist_km=18, min_pts=3):
+    """Agrupa raios próximos entre si (grade + union-find), igual à
+    versão JS do app desktop — pontos a até `dist_km` um do outro caem
+    na mesma célula; só vira célula com no mínimo `min_pts` raios."""
+    if raios_df.empty:
+        return []
+    pontos = raios_df[["lat", "lon"]].to_dict("records")
+    n = len(pontos)
+    tamanho_grade = dist_km / 111
+    buckets = defaultdict(list)
+    for i, p in enumerate(pontos):
+        buckets[(int(p["lat"] // tamanho_grade), int(p["lon"] // tamanho_grade))].append(i)
+
+    pai = list(range(n))
+
+    def _find(x):
+        while pai[x] != x:
+            pai[x] = pai[pai[x]]
+            x = pai[x]
+        return x
+
+    def _uniao(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            pai[ra] = rb
+
+    dist2_lim = dist_km ** 2
+    for (gx, gy), idxs in buckets.items():
+        vizinhos = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                vizinhos.extend(buckets.get((gx + dx, gy + dy), []))
+        for i in idxs:
+            for j in vizinhos:
+                if j <= i:
+                    continue
+                dlat = (pontos[i]["lat"] - pontos[j]["lat"]) * 111
+                latm = (pontos[i]["lat"] + pontos[j]["lat"]) / 2
+                dlon = (pontos[i]["lon"] - pontos[j]["lon"]) * 111 * math.cos(math.radians(latm))
+                if dlat * dlat + dlon * dlon <= dist2_lim:
+                    _uniao(i, j)
+
+    grupos_map = defaultdict(list)
+    for i in range(n):
+        grupos_map[_find(i)].append(pontos[i])
+    return [g for g in grupos_map.values() if len(g) >= min_pts]
+
+
+def atualizar_celulas_raio(grupos, agora_ts):
+    """Casa cada grupo de raios detectado agora com uma célula já
+    existente (centro mais próximo, até 60 km) ou cria uma célula nova.
+    Mantém até 6 posições de histórico por célula e descarta células
+    sem atualização há mais de 10 minutos."""
+    celulas = st.session_state.get("celulas_raio", [])
+    usadas = set()
+    for grupo in grupos:
+        lat = sum(p["lat"] for p in grupo) / len(grupo)
+        lon = sum(p["lon"] for p in grupo) / len(grupo)
+        melhor, menor_dist = None, float("inf")
+        for cel in celulas:
+            if cel["id"] in usadas:
+                continue
+            ult = cel["historico"][-1]
+            d = _dist_km(lat, lon, ult["lat"], ult["lon"])
+            if d < menor_dist:
+                menor_dist, melhor = d, cel
+        if melhor is not None and menor_dist <= 60:
+            alvo = melhor
+        else:
+            novo_id = st.session_state.get("proximo_id_celula", 1)
+            alvo = {"id": novo_id, "historico": []}
+            st.session_state.proximo_id_celula = novo_id + 1
+            celulas.append(alvo)
+        alvo["historico"].append({"lat": lat, "lon": lon, "t": agora_ts, "n": len(grupo)})
+        if len(alvo["historico"]) > 6:
+            alvo["historico"] = alvo["historico"][-6:]
+        alvo["ultima_atualizacao"] = agora_ts
+        usadas.add(alvo["id"])
+
+    celulas = [c for c in celulas if agora_ts - c["ultima_atualizacao"] <= 600]
+    st.session_state.celulas_raio = celulas
+    return celulas
+
+
+def calcular_trajetoria_celula(celula):
+    """A partir do histórico de posições de uma célula, calcula
+    velocidade/rumo estimados e projeta até 3 pontos futuros (+30/+60/
+    +90 min), igual à lógica do app desktop — só projeta se a
+    velocidade estimada for plausível (2-120 km/h) e ainda dentro da
+    América do Sul."""
+    hist = celula["historico"]
+    if len(hist) < 2:
+        return None
+    referencia, atual = hist[0], hist[-1]
+    dist_km = _dist_km(referencia["lat"], referencia["lon"], atual["lat"], atual["lon"])
+    horas = max((atual["t"] - referencia["t"]) / 3600, 1 / 3600)
+    vel_kmh = dist_km / horas
+    rumo_graus = _bearing_graus(referencia["lat"], referencia["lon"], atual["lat"], atual["lon"])
+    rumo_texto = _bearing_para_rumo(rumo_graus)
+
+    checkpoints = []
+    if len(hist) >= 3 and 2 <= vel_kmh <= 120:
+        b = SOUTH_AMERICA_BOUNDS
+        for passo in range(1, 4):
+            minutos_futuro = passo * 30
+            dist_proj = vel_kmh * (minutos_futuro / 60)
+            lat2, lon2 = _destino_ponto(atual["lat"], atual["lon"], rumo_graus, dist_proj)
+            if not (b["lat_min"] <= lat2 <= b["lat_max"] and b["lon_min"] <= lon2 <= b["lon_max"]):
+                break
+            checkpoints.append({"lat": lat2, "lon": lon2, "min": minutos_futuro})
+    return {"vel_kmh": vel_kmh, "rumo_texto": rumo_texto, "checkpoints": checkpoints}
+
+
+# ======================================================================
 # RESUMO POR ESTAÇÃO
 # ======================================================================
 def calcular_resumo_estacoes(df_full, target_date, safety_margin_pct, horas_filtro=None,
@@ -719,17 +922,19 @@ with st.sidebar:
     st.header("⚙ Configuração")
     meteorologista = st.text_input("Meteorologista responsável", value="")
 
-    st.subheader("📁 Planilha de estações")
-    arquivo_estacoes = st.file_uploader("Envie o .xlsx (colunas: estacao, lat, lon)", type=["xlsx"])
-    df_stations = None
-    if arquivo_estacoes is not None:
-        df_stations = pd.read_excel(arquivo_estacoes)
-        if df_stations.shape[1] != 3:
-            st.error(f"Esperava 3 colunas (estação/lat/lon), encontrei {df_stations.shape[1]}.")
-            df_stations = None
-        else:
-            df_stations.columns = ["estacao", "lat", "lon"]
-            st.success(f"{len(df_stations)} estações carregadas.")
+    st.subheader("📁 Estações")
+    df_stations = pd.DataFrame(ESTACOES_PADRAO)
+    st.caption(f"{len(df_stations)} unidades já cadastradas no app.")
+    with st.expander("Usar outra planilha (opcional)"):
+        arquivo_estacoes = st.file_uploader("Envie um .xlsx (colunas: estacao, lat, lon)", type=["xlsx"])
+        if arquivo_estacoes is not None:
+            df_custom = pd.read_excel(arquivo_estacoes)
+            if df_custom.shape[1] != 3:
+                st.error(f"Esperava 3 colunas (estação/lat/lon), encontrei {df_custom.shape[1]}.")
+            else:
+                df_custom.columns = ["estacao", "lat", "lon"]
+                df_stations = df_custom
+                st.success(f"Usando {len(df_stations)} estações da planilha enviada.")
 
     st.subheader("📅 Data e horários")
     target_date = st.date_input("Data da previsão", value=datetime.now().date())
@@ -749,14 +954,27 @@ with st.sidebar:
     incluir_raios = st.checkbox("Mostrar raios ao vivo no mapa", value=True)
     raios_minutos = st.slider("Janela de tempo (min)", 5, 60, 15, step=5, disabled=not incluir_raios)
     tocar_som = st.checkbox("Tocar som quando raio cair perto de uma unidade", value=True, disabled=not incluir_raios)
+    mostrar_deslocamento = st.checkbox("Mostrar deslocamento das células de tempestade", value=True, disabled=not incluir_raios)
+    st.caption("🔄 Atualiza sozinho a cada 2 minutos enquanto a página estiver aberta.")
 
-    variavel_mapa = st.radio("Variável exibida no mapa", ["Rajada de vento", "Precipitação", "CAPE"], horizontal=False)
+    st.subheader("📏 Raios de alerta ao redor das unidades")
+    mostrar_aneis = st.checkbox("Mostrar anéis de distância no mapa", value=False)
+    distancias_aneis = st.multiselect("Distâncias (km)", [30, 50, 100, 150, 200], default=[30, 50, 100, 150, 200],
+                                       disabled=not mostrar_aneis)
+
+    st.subheader("🏭 Selecionar unidade")
+    nomes_unidades_mapa = ["— Nenhuma (ver tudo) —"] + sorted(df_stations["estacao"].tolist(), key=lambda s: s.lower())
+    unidade_selecionada = st.selectbox("Buscar / selecionar unidade", nomes_unidades_mapa,
+                                        help="Digite pra filtrar ou escolha na lista — o mapa centraliza na unidade escolhida.")
+
+    st.subheader("🗺️ Variável e horário no mapa")
+    variavel_mapa = st.radio("Variável exibida", ["Rajada de vento", "Precipitação", "CAPE"], horizontal=False)
+    modo_horario = st.radio("Modo de exibição", ["Resumo do dia (acumulado)", "Hora específica"], horizontal=False)
+    hora_especifica = None
+    if modo_horario == "Hora específica" and horas_selecionadas:
+        hora_especifica = st.select_slider("Horário (UTC)", options=sorted(horas_selecionadas), value=sorted(horas_selecionadas)[0])
 
     gerar = st.button("🌍 Gerar / Atualizar mapa", type="primary", use_container_width=True)
-
-if df_stations is None:
-    st.info("⬅️ Envie a planilha de estações (.xlsx com colunas estação/lat/lon) na barra lateral pra começar.")
-    st.stop()
 
 margin = 1.5
 bbox = {"lon_min": df_stations["lon"].min() - margin, "lon_max": df_stations["lon"].max() + margin,
@@ -786,6 +1004,9 @@ if gerar:
 
         st.session_state.df_full = df_final
         st.session_state.modelo_label = modelo_label
+        # guarda os 3 modelos individuais (GFS/ICON/ECMWF) separados, sem
+        # filtro de margem/horário — usados na aba de comparação de modelos
+        st.session_state.dfs_base = {m: dfs_base[m] for m in ENSEMBLE_MODELOS if m in dfs_base}
         st.session_state.params = dict(target_date=str(target_date), horas=horas_selecionadas, margin_pct=margin_pct,
                                         alerta_gust_min=alerta_gust_min, alerta_cape_min=alerta_cape_min, meteorologista=meteorologista)
 
@@ -805,11 +1026,25 @@ if df_estacoes.empty:
 
 # --------- raios (opcional) ---------
 raios_df = pd.DataFrame()
+celulas_com_trajetoria = []
 if incluir_raios:
+    st_autorefresh(interval=120_000, key="raios_autorefresh_timer")  # atualiza sozinho a cada 2 min
+
     try:
         raios_df = fetch_glm_flashes_recent(minutos=raios_minutos)
+        st.session_state.ultima_atualizacao_raios = datetime.now(timezone.utc)
+        st.session_state.ultimo_erro_raios = None
     except Exception as e:
-        st.sidebar.warning(f"GLM indisponível: {e}")
+        st.session_state.ultimo_erro_raios = str(e)
+
+    if mostrar_deslocamento and not raios_df.empty:
+        grupos = clusterizar_raios(raios_df)
+        agora_ts = time.time()
+        celulas = atualizar_celulas_raio(grupos, agora_ts)
+        for cel in celulas:
+            traj = calcular_trajetoria_celula(cel)
+            if traj is not None:
+                celulas_com_trajetoria.append({**cel, "trajetoria": traj})
 
     if not raios_df.empty:
         for _, raio in raios_df.iterrows():
@@ -843,19 +1078,64 @@ var_map = {"Rajada de vento": ("max_gust", gust_color_hex, "km/h"), "Precipitaç
            "CAPE": ("max_cape", cape_color_hex, "J/kg")}
 chave_var, color_fn, unidade_var = var_map[variavel_mapa]
 
+chave_dado_hora = {"Rajada de vento": "gusts", "Precipitação": "precip", "CAPE": "capes"}[variavel_mapa]
+
 with col_mapa:
-    center_lat = (bbox["lat_min"] + bbox["lat_max"]) / 2
-    center_lon = (bbox["lon_min"] + bbox["lon_max"]) / 2
-    m = folium.Map(location=[center_lat, center_lon], tiles="CartoDB dark_matter", control_scale=True)
-    m.fit_bounds([[bbox["lat_min"], bbox["lon_min"]], [bbox["lat_max"], bbox["lon_max"]]])
+    if hora_especifica:
+        st.caption(f"🕐 Mostrando previsão pontual das **{hora_especifica}:00 UTC** — {variavel_mapa}")
+    else:
+        st.caption(f"📊 Mostrando o **resumo acumulado do dia** — {variavel_mapa}")
+
+    if incluir_raios:
+        ultima_att = st.session_state.get("ultima_atualizacao_raios")
+        if ultima_att is not None:
+            hora_utc = ultima_att.strftime("%H:%M:%S")
+            hora_local = (ultima_att - timedelta(hours=3)).strftime("%H:%M:%S")
+            st.info(f"⚡ **Raios (GLM/GOES-19) atualizados às {hora_utc} UTC** (≈ {hora_local} em Brasília) · "
+                    f"atualiza sozinho a cada 2 minutos", icon="🕐")
+        erro_raios = st.session_state.get("ultimo_erro_raios")
+        if erro_raios:
+            st.warning(f"GLM indisponível no momento: {erro_raios}")
+
+    unidade_focada = None
+    if unidade_selecionada != "— Nenhuma (ver tudo) —":
+        linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_selecionada]
+        if not linhas_foco.empty:
+            unidade_focada = linhas_foco.iloc[0]
+
+    if unidade_focada is not None:
+        m = folium.Map(location=[unidade_focada["lat"], unidade_focada["lon"]], zoom_start=10,
+                        tiles="CartoDB dark_matter", control_scale=True)
+    else:
+        center_lat = (bbox["lat_min"] + bbox["lat_max"]) / 2
+        center_lon = (bbox["lon_min"] + bbox["lon_max"]) / 2
+        m = folium.Map(location=[center_lat, center_lon], tiles="CartoDB dark_matter", control_scale=True)
+        m.fit_bounds([[bbox["lat_min"], bbox["lon_min"]], [bbox["lat_max"], bbox["lon_max"]]])
+
+    aneis_fg = folium.FeatureGroup(name="📏 Raios de alerta ao redor das unidades", show=mostrar_aneis)
 
     for _, e in df_estacoes.iterrows():
-        cor_valor = color_fn(e[chave_var])
+        if hora_especifica and e["horas"]:
+            try:
+                idx_hora = e["horas"].index(f"{hora_especifica}:00")
+                valor_hora = e[chave_dado_hora][idx_hora]
+            except ValueError:
+                valor_hora = None
+            valor_exibido = valor_hora if valor_hora is not None else 0.0
+            cor_valor = color_fn(valor_exibido)
+            texto_valor = f"{valor_exibido:.1f} {unidade_var}" if valor_hora is not None else "sem dado nessa hora"
+        else:
+            valor_exibido = e[chave_var]
+            cor_valor = color_fn(valor_exibido)
+            texto_valor = f"{valor_exibido:.1f} {unidade_var}"
+
         popup_html = (f"<b>{e['risco_emoji']} {e['nome']}</b><br/>"
                       f"Risco combinado: <b style='color:{e['risco_color']}'>{e['risco_label']}</b><br/>"
-                      f"Rajada máx.: {e['max_gust']:.0f} km/h<br/>"
-                      f"Chuva acum.: {e['soma_precip']:.1f} mm<br/>"
-                      f"CAPE máx.: {e['max_cape']:.0f} J/kg")
+                      f"{variavel_mapa} {'às ' + hora_especifica + ':00 UTC' if hora_especifica else '(resumo do dia)'}: "
+                      f"<b>{texto_valor}</b><br/><hr/>"
+                      f"Rajada máx. do dia: {e['max_gust']:.0f} km/h<br/>"
+                      f"Chuva acum. do dia: {e['soma_precip']:.1f} mm<br/>"
+                      f"CAPE máx. do dia: {e['max_cape']:.0f} J/kg")
         if e["contatos"]:
             popup_html += f"<hr/><b>📞 {e['contatos']['nome']}</b><br/>"
             for item in e["contatos"]["numeros"][:3]:
@@ -863,12 +1143,29 @@ with col_mapa:
                 if item.get("descricao"):
                     popup_html += f" <i>({item['descricao']})</i>"
                 popup_html += "<br/>"
+
+        eh_unidade_focada = unidade_focada is not None and e["estacao"] == unidade_focada["estacao"]
+        if eh_unidade_focada:
+            # anel pulsante em volta da unidade selecionada, pra destacar no mapa
+            folium.CircleMarker(location=[e["lat"], e["lon"]], radius=16, color="#3fc2c2", weight=2,
+                                 fill=False, opacity=0.9, dash_array="4, 4").add_to(m)
         folium.CircleMarker(
-            location=[e["lat"], e["lon"]], radius=8, color=e["risco_color"], weight=3,
+            location=[e["lat"], e["lon"]], radius=11 if eh_unidade_focada else 8,
+            color=e["risco_color"], weight=3 if not eh_unidade_focada else 4,
             fill=True, fill_color=cor_valor, fill_opacity=0.9,
-            tooltip=f"{e['risco_emoji']} {e['nome']} — {e[chave_var]:.1f} {unidade_var}",
-            popup=folium.Popup(popup_html, max_width=260),
+            tooltip=f"{e['risco_emoji']} {e['nome']} — {texto_valor}",
+            popup=folium.Popup(popup_html, max_width=260, show=eh_unidade_focada),
         ).add_to(m)
+
+        if mostrar_aneis:
+            for raio_km, cor_raio in RAIOS_ALERTA_KM:
+                if raio_km not in distancias_aneis:
+                    continue
+                folium.Circle(location=[e["lat"], e["lon"]], radius=raio_km * 1000, color=cor_raio,
+                              weight=1.5, fill=False, dash_array="6, 6", opacity=0.85,
+                              tooltip=f"{e['nome']} — raio de {raio_km} km").add_to(aneis_fg)
+
+    aneis_fg.add_to(m)
 
     if incluir_raios and not raios_df.empty:
         agora = datetime.now(timezone.utc)
@@ -880,10 +1177,53 @@ with col_mapa:
                                  fill=True, fill_color=cor, fill_opacity=0.8,
                                  tooltip=f"⚡ ~{idade_min:.0f} min atrás").add_to(m)
 
+    if mostrar_deslocamento and celulas_com_trajetoria:
+        deslocamento_fg = folium.FeatureGroup(name="🌀 Deslocamento das células de tempestade", show=True)
+        for cel in celulas_com_trajetoria:
+            hist = cel["historico"]
+            traj = cel["trajetoria"]
+            n = len(hist)
+
+            pontos_linha = [[p["lat"], p["lon"]] for p in hist] + [[c["lat"], c["lon"]] for c in traj["checkpoints"]]
+            folium.PolyLine(pontos_linha, color="#e5e7eb", weight=1.5, opacity=0.55, dash_array="6, 5").add_to(deslocamento_fg)
+
+            # histórico da célula — "X" colorido do mais antigo (vermelho) ao mais recente (verde)
+            for i, p in enumerate(hist):
+                fracao = i / (n - 1) if n > 1 else 1
+                if fracao <= 0.5:
+                    a, b_, t = (239, 68, 68), (234, 179, 8), fracao / 0.5
+                else:
+                    a, b_, t = (234, 179, 8), (34, 197, 94), (fracao - 0.5) / 0.5
+                cor_x = f"rgb({round(a[0]+(b_[0]-a[0])*t)},{round(a[1]+(b_[1]-a[1])*t)},{round(a[2]+(b_[2]-a[2])*t)})"
+                eh_atual = (i == n - 1)
+                tamanho = 18 if eh_atual else 13
+                icone = folium.DivIcon(html=(
+                    f'<div style="font-weight:900; font-size:{tamanho}px; color:{cor_x}; '
+                    f'text-shadow:0 0 4px #000,0 0 7px #000; line-height:1;">✕</div>'
+                ), icon_size=(tamanho + 6, tamanho + 6), icon_anchor=((tamanho + 6) // 2, (tamanho + 6) // 2))
+                marcador = folium.Marker(location=[p["lat"], p["lon"]], icon=icone)
+                if eh_atual:
+                    marcador.add_child(folium.Tooltip(
+                        f"Célula #{cel['id']} · {p['n']} raios · ~{traj['vel_kmh']:.0f} km/h para {traj['rumo_texto']}"))
+                marcador.add_to(deslocamento_fg)
+
+            # posições futuras projetadas (+30/+60/+90 min)
+            for idx_c, c in enumerate(traj["checkpoints"]):
+                opacidade = max(0.75 - idx_c * 0.18, 0.2)
+                hora_estim = (datetime.now(timezone.utc) + timedelta(minutes=c["min"])).strftime("%H:%M")
+                folium.CircleMarker(
+                    location=[c["lat"], c["lon"]], radius=3.5, color="#e5e7eb", weight=1,
+                    fill=True, fill_color="#e5e7eb", fill_opacity=opacidade, opacity=opacidade,
+                    tooltip=f"Célula #{cel['id']} — alcance estimado em +{c['min']} min (~{hora_estim} UTC)",
+                ).add_to(deslocamento_fg)
+        deslocamento_fg.add_to(m)
+
+    folium.LayerControl(collapsed=True).add_to(m)
     st_folium(m, height=620, use_container_width=True, returned_objects=[])
 
 with col_lado:
-    tab_risco, tab_rank, tab_alertas, tab_raio, tab_contatos = st.tabs(["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📞 Contatos"])
+    tab_risco, tab_rank, tab_alertas, tab_raio, tab_comp, tab_contatos = st.tabs(
+        ["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios", "📊 Comparar modelos", "📞 Contatos"])
 
     with tab_risco:
         em_risco = df_estacoes[df_estacoes["risco_score"] > 0].sort_values("risco_score", ascending=False)
@@ -909,7 +1249,19 @@ with col_lado:
                     st.code(a["texto"], language=None)
 
     with tab_raio:
-        st.caption(f"Monitorando raios (GLM/GOES-19) — janela de {raios_minutos} min." if incluir_raios else "Raios desativados na barra lateral.")
+        if incluir_raios:
+            ultima_att = st.session_state.get("ultima_atualizacao_raios")
+            if ultima_att is not None:
+                st.caption(f"🕐 Última atualização: **{ultima_att.strftime('%H:%M:%S')} UTC** · "
+                           f"janela de {raios_minutos} min · atualiza a cada 2 min")
+            if celulas_com_trajetoria:
+                st.markdown(f"**{len(celulas_com_trajetoria)} célula(s) de tempestade em deslocamento:**")
+                for cel in celulas_com_trajetoria:
+                    traj = cel["trajetoria"]
+                    st.caption(f"🌀 Célula #{cel['id']} — {cel['historico'][-1]['n']} raios · "
+                               f"~{traj['vel_kmh']:.0f} km/h para {traj['rumo_texto']}")
+        else:
+            st.caption("Raios desativados na barra lateral.")
         if st.session_state.alertas_raio_ativos:
             for a in st.session_state.alertas_raio_ativos:
                 with st.container(border=True):
@@ -917,6 +1269,43 @@ with col_lado:
                     st.code(a["texto"], language=None)
         else:
             st.info("Nenhum alerta de raio próximo ativo.")
+
+    with tab_comp:
+        dfs_base_comp = st.session_state.get("dfs_base")
+        if not dfs_base_comp:
+            st.info("Gere o mapa pelo menos uma vez pra ver a comparação entre modelos.")
+        else:
+            nomes_estacoes_comp = df_estacoes["estacao"].tolist()
+            indice_padrao = nomes_estacoes_comp.index(unidade_focada["estacao"]) if unidade_focada is not None and unidade_focada["estacao"] in nomes_estacoes_comp else 0
+            estacao_escolhida = st.selectbox("Estação", nomes_estacoes_comp, index=indice_padrao,
+                                              format_func=lambda s: s.split(" - ")[0])
+            var_comp_map = {"Rajada de vento": ("wind_gust_kmh", "km/h"), "Precipitação": ("precip_mm", "mm"),
+                             "CAPE": ("cape_jkg", "J/kg")}
+            coluna_comp, unidade_comp = var_comp_map[variavel_mapa]
+            st.caption(f"Comparando GFS · ICON · ECMWF — {variavel_mapa}, todas as 24h de {params['target_date']}")
+
+            horas_full = [f"{h:02d}:00" for h in range(24)]
+            tabela_comp = pd.DataFrame({"hora": horas_full}).set_index("hora")
+            for modelo_id, label in [("gfs_seamless", "GFS"), ("icon_seamless", "ICON"), ("ecmwf_ifs025", "ECMWF")]:
+                d_modelo = dfs_base_comp.get(modelo_id)
+                if d_modelo is None:
+                    continue
+                sel = d_modelo[(d_modelo["estacao"] == estacao_escolhida) &
+                               (d_modelo["valid_time"].dt.date == pd.Timestamp(params["target_date"]).date())].copy()
+                if sel.empty:
+                    continue
+                sel["hora"] = sel["valid_time"].dt.strftime("%H:00")
+                serie = sel.set_index("hora")[coluna_comp]
+                if coluna_comp == "wind_gust_kmh":
+                    serie = serie * (1 + params["margin_pct"] / 100)
+                tabela_comp[label] = serie
+
+            tabela_comp = tabela_comp.dropna(how="all")
+            if tabela_comp.empty:
+                st.warning("Sem dados de comparação pra essa estação/dia.")
+            else:
+                st.line_chart(tabela_comp, height=280)
+                st.caption(f"Valores em {unidade_comp}. Quanto mais os modelos concordam, maior a confiança na previsão.")
 
     with tab_contatos:
         nomes_unidades = sorted(CONTATOS_UNIDADES.keys(), key=lambda k: CONTATOS_UNIDADES[k]["nome"].lower())
