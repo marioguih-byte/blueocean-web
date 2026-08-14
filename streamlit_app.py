@@ -836,11 +836,15 @@ var_map = {"Rajada de vento": ("max_gust", gust_color_hex, "km/h"), "Precipitaç
 chave_var, color_fn, unidade_var = var_map[variavel_mapa]
 chave_dado_hora = {"Rajada de vento": "gusts", "Precipitação": "precip", "CAPE": "capes"}[variavel_mapa]
 
-@st.dialog("⚡ Raio próximo de uma unidade!")
+@st.dialog("⚡ Raio próximo de unidade(s)!")
 def _dialog_alerta_raio():
     texto = st.session_state.get("dialog_raio_texto")
     if not texto: return
-    st.warning("Foi detectado um raio próximo de uma unidade monitorada. Copie a mensagem abaixo:")
+    n_unidades = texto.count("* Local:")
+    if n_unidades > 1:
+        st.warning(f"Foram detectados raios próximos de **{n_unidades} unidades** monitoradas ao mesmo tempo. Copie as mensagens abaixo:")
+    else:
+        st.warning("Foi detectado um raio próximo de uma unidade monitorada. Copie a mensagem abaixo:")
     st.code(texto, language=None)
 
 def _atualizar_dados_raios():
@@ -868,6 +872,7 @@ def _atualizar_dados_raios():
                 if traj is not None: celulas_com_trajetoria.append({**cel, "trajetoria": traj})
 
         if not raios_df.empty:
+            notificacoes_desta_rodada = []
             for _, est in df_estacoes.iterrows():
                 # menor distância até qualquer raio ativo no momento
                 dists = ((raios_df["lat"] - est["lat"]) ** 2 + (raios_df["lon"] - est["lon"]) ** 2) ** 0.5 * 111
@@ -896,8 +901,14 @@ def _atualizar_dados_raios():
                     }
                     texto = montar_mensagem_proximidade_raio(nivel_km, est["nome"], params["meteorologista"], renovacao=renovacao)
                     st.session_state.alertas_raio_ativos.insert(0, {"id": f"{est['nome']}_{agora_ts}", "texto": texto, "estacao": est["nome"], "expira": agora_ts + 3600})
-                    st.session_state.dialog_raio_texto = texto
-                    st.session_state.dialog_raio_ts = agora_ts
+                    notificacoes_desta_rodada.append(texto)
+
+            # Se mais de uma unidade disparou alerta na mesma rodada, junta
+            # tudo num único pop-up em vez de mostrar só o último.
+            if notificacoes_desta_rodada:
+                separador = "\n\n" + ("─" * 30) + "\n\n"
+                st.session_state.dialog_raio_texto = separador.join(notificacoes_desta_rodada)
+                st.session_state.dialog_raio_ts = time.time()
 
     st.session_state.alertas_raio_ativos = [a for a in st.session_state.alertas_raio_ativos if a["expira"] > time.time()]
     st.session_state["_fragment_raios_df"] = raios_df
