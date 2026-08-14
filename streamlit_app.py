@@ -895,7 +895,7 @@ def _atualizar_dados_raios():
                         "nivel": nivel_atual, "notificado_ts": agora_ts, "expira_ts": agora_ts + 3600,
                     }
                     texto = montar_mensagem_proximidade_raio(nivel_km, est["nome"], params["meteorologista"], renovacao=renovacao)
-                    st.session_state.alertas_raio_ativos.insert(0, {"texto": texto, "estacao": est["nome"], "expira": agora_ts + 3600})
+                    st.session_state.alertas_raio_ativos.insert(0, {"id": f"{est['nome']}_{agora_ts}", "texto": texto, "estacao": est["nome"], "expira": agora_ts + 3600})
                     st.session_state.dialog_raio_texto = texto
                     st.session_state.dialog_raio_ts = agora_ts
 
@@ -1316,10 +1316,17 @@ with col_lado:
                 else: st.caption("Raios desativados na barra lateral.")
 
                 if st.session_state.alertas_raio_ativos:
+                    if st.button("🗑️ Limpar todos os alertas", key="limpar_todos_alertas", use_container_width=True):
+                        st.session_state.alertas_raio_ativos = []
                     for a in st.session_state.alertas_raio_ativos:
                         with st.container(border=True):
-                            st.text(a["texto"])
-                            st.code(a["texto"], language=None)
+                            col_txt, col_del = st.columns([6, 1])
+                            with col_txt:
+                                st.text(a["texto"])
+                                st.code(a["texto"], language=None)
+                            with col_del:
+                                if st.button("✕", key=f"excluir_alerta_{a.get('id', a['texto'])}", help="Excluir este alerta"):
+                                    st.session_state.alertas_raio_ativos = [x for x in st.session_state.alertas_raio_ativos if x.get("id") != a.get("id")]
                 else:
                     st.info("Nenhum alerta de raio próximo ativo.")
 
