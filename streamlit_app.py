@@ -741,6 +741,7 @@ with st.sidebar:
     intervalo_raios_seg = st.slider("Intervalo de atualização dos raios (segundos)", 10, 120, 30, step=10, disabled=not incluir_raios)
     tocar_som = True
     st.caption("🔊 O som e o pop-up automático de alerta ficam sempre ativos quando os raios estão ligados.")
+    arquivo_som = st.file_uploader("Trocar o som de alerta (opcional)", type=["mp3", "wav", "ogg", "m4a"], disabled=not incluir_raios)
     mostrar_deslocamento = st.checkbox("Mostrar deslocamento das células de tempestade", value=True, disabled=not incluir_raios)
     st.caption("🔄 Só os raios (pontos, células e alertas) atualizam sozinhos — o mapa em si (zoom, posição, pop-ups abertos) não é recarregado.")
 
@@ -756,6 +757,27 @@ with st.sidebar:
         hora_especifica = st.select_slider("Horário", options=sorted(horas_selecionadas), value=sorted(horas_selecionadas)[0])
 
     gerar = st.button("🌍 Gerar / Atualizar mapa", type="primary", use_container_width=True)
+
+# --------------------------------------------------------------
+# Som de alerta personalizado: se a pessoa subiu um arquivo, salva ele
+# no static/ (pra poder ser tocado pelo JS do mapa) e passa a usar esse
+# em vez do padrão. Fica valendo enquanto durar a sessão.
+# --------------------------------------------------------------
+som_alerta_nome_ativo = SOM_ALERTA_NOME
+if arquivo_som is not None:
+    ext = os.path.splitext(arquivo_som.name)[1].lower() or ".mp3"
+    conteudo = arquivo_som.getvalue()
+    # nome baseado no hash do conteúdo: evita um usuário sobrescrever o
+    # som de outro se o app estiver sendo usado por mais de uma pessoa
+    # ao mesmo tempo (o static/ é compartilhado entre sessões).
+    hash_conteudo = abs(hash(conteudo)) % (10**10)
+    nome_custom = f"alerta_custom_{hash_conteudo}{ext}"
+    caminho_custom = os.path.join(STATIC_DIR, nome_custom)
+    if not os.path.exists(caminho_custom):
+        with open(caminho_custom, "wb") as f:
+            f.write(conteudo)
+    som_alerta_nome_ativo = nome_custom
+    st.sidebar.audio(arquivo_som, format=f"audio/{ext.lstrip('.')}")
 
 margin = 1.5
 bbox = {"lon_min": df_stations["lon"].min() - margin, "lon_max": df_stations["lon"].max() + margin, "lat_min": df_stations["lat"].min() - margin, "lat_max": df_stations["lat"].max() + margin}
@@ -1120,7 +1142,7 @@ window.addEventListener("load", function() {{
             "marcadores": marcadores_js,
             "intervaloMs": int(intervalo_raios_seg) * 1000,
             "janelaMin": raios_minutos,
-            "somUrl": f"app/static/{SOM_ALERTA_NOME}",
+            "somUrl": f"app/static/{som_alerta_nome_ativo}",
             "jsonUrl": "app/static/raios_live.json",
             "mostrarDeslocamento": bool(mostrar_deslocamento),
             "tocarSom": bool(tocar_som),
@@ -1287,18 +1309,28 @@ with col_lado:
                         st.code(a["texto"], language=None)
 
         with tab_raio:
-            if incluir_raios:
-                ultima_att = st.session_state.get("ultima_atualizacao_raios")
-                if ultima_att is not None: st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')}** · janela de {raios_minutos} min · atualiza a cada {intervalo_raios_seg}s")
-            else: st.caption("Raios desativados na barra lateral.")
+            def _corpo_tab_raio():
+                if incluir_raios:
+                    ultima_att = st.session_state.get("ultima_atualizacao_raios")
+                    if ultima_att is not None: st.caption(f"🕐 Última atualização: **{utc_para_brasilia(ultima_att).strftime('%H:%M:%S')}** · janela de {raios_minutos} min · atualiza a cada {intervalo_raios_seg}s")
+                else: st.caption("Raios desativados na barra lateral.")
 
-            if st.session_state.alertas_raio_ativos:
-                for a in st.session_state.alertas_raio_ativos:
-                    with st.container(border=True):
-                        st.text(a["texto"])
-                        st.code(a["texto"], language=None)
+                if st.session_state.alertas_raio_ativos:
+                    for a in st.session_state.alertas_raio_ativos:
+                        with st.container(border=True):
+                            st.text(a["texto"])
+                            st.code(a["texto"], language=None)
+                else:
+                    st.info("Nenhum alerta de raio próximo ativo.")
+
+            # Fragmento próprio, no mesmo intervalo dos raios — assim essa
+            # lista atualiza junto (no mesmo instante) que o pop-up de
+            # alerta aparece, sem precisar de uma interação manual pra
+            # a aba "Raios" refletir o alerta mais recente.
+            if incluir_raios:
+                st.fragment(run_every=intervalo_raios_seg)(_corpo_tab_raio)()
             else:
-                st.info("Nenhum alerta de raio próximo ativo.")
+                _corpo_tab_raio()
 
 st.divider()
 col_pdf, _ = st.columns([1, 3])
