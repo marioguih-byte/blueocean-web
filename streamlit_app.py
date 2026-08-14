@@ -792,23 +792,6 @@ var_map = {"Rajada de vento": ("max_gust", gust_color_hex, "km/h"), "Precipitaç
 chave_var, color_fn, unidade_var = var_map[variavel_mapa]
 chave_dado_hora = {"Rajada de vento": "gusts", "Precipitação": "precip", "CAPE": "capes"}[variavel_mapa]
 
-# --------------------------------------------------------------
-# "Ponte" escondida: o JS do mapa preenche esse campo (via DOM,
-# sem navegação — o iframe do componente não tem permissão pra
-# navegar a página principal) quando alguém clica em "Ver previsão
-# horária" no pop-up de uma unidade. O Streamlit então reage a essa
-# mudança normalmente, como qualquer outro widget.
-# --------------------------------------------------------------
-st.markdown(
-    "<style>.st-key-ponte_previsao { position: fixed !important; top: -1000px !important; "
-    "left: -1000px !important; width: 1px !important; height: 1px !important; overflow: hidden !important; }</style>",
-    unsafe_allow_html=True,
-)
-if st.session_state.pop("_limpar_previsao_flag", False):
-    st.session_state["bridge_unidade_previsao"] = ""
-with st.container(key="ponte_previsao"):
-    st.text_input("bridge_unidade_previsao", key="bridge_unidade_previsao", label_visibility="collapsed")
-
 @st.dialog("⚡ Raio próximo de uma unidade!")
 def _dialog_alerta_raio():
     texto = st.session_state.get("dialog_raio_texto")
@@ -903,6 +886,8 @@ def _construir_mapa():
     aneis_fg = folium.FeatureGroup(name="📏 Raios de alerta ao redor das unidades", show=mostrar_aneis)
     marcadores_js = {}
     estacoes_para_js = []
+    dados_estacoes = {}
+    marcadores_bind_js = []
 
     for _, e in df_estacoes.iterrows():
         if hora_especifica and e["horas"]:
@@ -919,29 +904,21 @@ def _construir_mapa():
             cor_valor = color_fn(valor_exibido)
             texto_valor = f"{valor_exibido:.1f} {unidade_var}"
 
-        popup_html = (f"<b>{e['risco_emoji']} {e['nome']}</b><br/>Risco combinado: <b style='color:{e['risco_color']}'>{e['risco_label']}</b><br/>{variavel_mapa} {'às ' + hora_especifica + ':00' if hora_especifica else '(resumo do dia)'}: <b>{texto_valor}</b><br/><hr/>Rajada máx. do dia: {e['max_gust']:.0f} km/h<br/>Chuva acum. do dia: {e['soma_precip']:.1f} mm<br/>CAPE máx. do dia: {e['max_cape']:.0f} J/kg")
-
-        estacao_js_str = json.dumps(e["estacao"]).replace('"', "&quot;")
-        popup_html += (
-            f"<br/><button onclick='window.blueoceanAbrirPrevisao({estacao_js_str})' "
-            "style='display:inline-block; margin-top:6px; padding:4px 10px; background:#2563eb; "
-            "color:#fff; border:none; border-radius:5px; cursor:pointer; font-size:12px;'>"
-            "📈 Ver previsão horária completa</button>"
-        )
-
-        if e["contatos"]:
-            popup_html += f"<hr/><b>📞 {e['contatos']['nome']}</b><br/>"
-            for item in e["contatos"]["numeros"][:3]:
-                popup_html += f"{item['numero']}"
-                if item.get("descricao"): popup_html += f" <i>({item['descricao']})</i>"
-                popup_html += "<br/>"
-
-        marcador_estacao = folium.CircleMarker(location=[e["lat"], e["lon"]], radius=8, color=e["risco_color"], weight=3, fill=True, fill_color=cor_valor, fill_opacity=0.9, tooltip=f"{e['risco_emoji']} {e['nome']} — {texto_valor}", popup=folium.Popup(popup_html, max_width=320, show=False))
+        marcador_estacao = folium.CircleMarker(location=[e["lat"], e["lon"]], radius=8, color=e["risco_color"], weight=3, fill=True, fill_color=cor_valor, fill_opacity=0.9, tooltip=f"{e['risco_emoji']} {e['nome']} — {texto_valor}")
         marcador_estacao.add_to(m)
-        # guarda o nome da variável JS do marcador pra poder abrir o pop-up
-        # automaticamente e checar distância quando cair um raio perto
         marcadores_js[e["nome"]] = marcador_estacao.get_name()
         estacoes_para_js.append({"nome": e["nome"], "lat": e["lat"], "lon": e["lon"]})
+
+        # dados completos da estação pro painel que abre no clique — 100%
+        # client-side, sem precisar de nenhuma "ponte" com o Streamlit
+        dados_estacoes[e["estacao"]] = {
+            "nome": e["nome"], "horas": e["horas"], "gusts": e["gusts"], "precip": e["precip"], "capes": e["capes"],
+            "max_gust": e["max_gust"], "soma_precip": e["soma_precip"], "max_cape": e["max_cape"],
+            "risco_emoji": e["risco_emoji"], "risco_label": e["risco_label"], "risco_color": e["risco_color"],
+            "cor_gust": gust_color_hex(e["max_gust"]), "cor_precip": rain_color_hex(e["soma_precip"]), "cor_cape": cape_color_hex(e["max_cape"]),
+            "contatos": e["contatos"],
+        }
+        marcadores_bind_js.append(f"{marcador_estacao.get_name()}.on('click', function() {{ window.blueoceanAbrirPainel({json.dumps(e['estacao'])}); }});")
 
         if mostrar_aneis:
             for raio_km, cor_raio in RAIOS_ALERTA_KM:
@@ -952,6 +929,113 @@ def _construir_mapa():
     raios_fg = folium.FeatureGroup(name="⚡ Raios ao vivo", show=True)
     raios_fg.add_to(m)
     folium.LayerControl(collapsed=True).add_to(m)
+
+    # --------------------------------------------------------------
+    # Painel de previsão horária — abre ao clicar numa unidade, igual
+    # no app desktop: 100% desenhado em JS (Chart.js), sem precisar
+    # mandar nada de volta pro Python. Os dados de todas as unidades já
+    # vão embutidos no mapa, então abrir o painel é instantâneo.
+    # --------------------------------------------------------------
+    painel_estacao_html = """
+<div id="painel_estacao" style="display:none; position:absolute; top:44px; left:50px; z-index:1000; width:300px;
+     max-height:calc(100% - 90px); overflow-y:auto; background:#12161ff2; color:#f0f2f5; padding:12px 14px;
+     border:1px solid #3fc2c2; border-radius:8px; font-family:'Segoe UI', Arial, sans-serif; box-shadow:0 4px 14px rgba(0,0,0,0.5);">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+    <div id="painel_estacao_nome" style="font-size:14px; font-weight:bold; color:#3fc2c2; padding-right:8px;">—</div>
+    <span onclick="document.getElementById('painel_estacao').style.display='none';"
+          style="cursor:pointer; color:#ff6b5e; font-weight:bold; flex-shrink:0;">✕</span>
+  </div>
+  <div id="painel_estacao_resumo" style="font-size:11px; color:#8b93a3; margin:8px 0;">—</div>
+  <canvas id="painel_estacao_canvas" width="270" height="150"></canvas>
+  <div id="painel_estacao_contatos" style="font-size:11.5px; margin-top:10px;"></div>
+</div>
+"""
+    m.get_root().html.add_child(folium.Element(painel_estacao_html))
+
+    dados_estacoes_json = json.dumps(dados_estacoes, ensure_ascii=False).replace("</", "<\\/")
+    marcadores_bind_str = "\n".join(marcadores_bind_js)
+    painel_estacao_script = f"""
+<script>
+(function() {{
+    var dadosEstacoes = {dados_estacoes_json};
+    var painelChart = null;
+
+    function renderizarContatos(contatos) {{
+        var corpo = document.getElementById("painel_estacao_contatos");
+        if (!contatos || !contatos.numeros || !contatos.numeros.length) {{
+            corpo.innerHTML = "";
+            return;
+        }}
+        var html = "<hr style='border-color:#2a2f3a;'/><b style='color:#3fc2c2;'>📞 " + contatos.nome + "</b><br/>";
+        contatos.numeros.slice(0, 3).forEach(function(item) {{
+            html += item.numero;
+            if (item.descricao) html += " <i style='color:#8b93a3;'>(" + item.descricao + ")</i>";
+            html += "<br/>";
+        }});
+        corpo.innerHTML = html;
+    }}
+
+    function montarGrafico(d) {{
+        var ctx = document.getElementById("painel_estacao_canvas").getContext("2d");
+        if (painelChart) {{ painelChart.destroy(); }}
+        painelChart = new Chart(ctx, {{
+            type: "line",
+            data: {{
+                labels: d.horas,
+                datasets: [
+                    {{ label: "Rajada (km/h)", data: d.gusts, borderColor: d.cor_gust, backgroundColor: d.cor_gust + "33",
+                       yAxisID: "y", fill: true, tension: 0.3, borderWidth: 2, spanGaps: false, pointRadius: 2 }},
+                    {{ label: "Chuva (mm)", data: d.precip, type: "bar", backgroundColor: (d.cor_precip || "#4fa8f0") + "99",
+                       yAxisID: "y1", spanGaps: false }},
+                    {{ label: "CAPE (J/kg)", data: d.capes, borderColor: (d.cor_cape || "#f97316"), backgroundColor: "transparent",
+                       yAxisID: "y2", fill: false, tension: 0.3, borderWidth: 1.6, borderDash: [4, 3], pointRadius: 1.5, spanGaps: false }},
+                ]
+            }},
+            options: {{
+                responsive: false, animation: false,
+                plugins: {{ legend: {{ display: true, labels: {{ color: "#8b93a3", font: {{ size: 9 }}, boxWidth: 10 }} }} }},
+                scales: {{
+                    x: {{ ticks: {{ color: "#8b93a3", font: {{ size: 8 }}, maxTicksLimit: 8 }}, grid: {{ color: "#2a2f3a" }} }},
+                    y: {{ position: "left", min: 0, beginAtZero: true, ticks: {{ color: "#8b93a3", font: {{ size: 9 }} }}, grid: {{ color: "#2a2f3a" }} }},
+                    y1: {{ position: "right", min: 0, beginAtZero: true, ticks: {{ color: "#8b93a3", font: {{ size: 9 }} }}, grid: {{ display: false }} }},
+                    y2: {{ display: false, min: 0, beginAtZero: true }},
+                }}
+            }}
+        }});
+    }}
+
+    window.blueoceanAbrirPainel = function(chave) {{
+        var d = dadosEstacoes[chave];
+        if (!d) return;
+
+        document.getElementById("painel_estacao").style.display = "block";
+        document.getElementById("painel_estacao_nome").textContent = (d.risco_emoji || "") + " " + d.nome;
+        document.getElementById("painel_estacao_resumo").innerHTML =
+            "Risco combinado: <b style='color:" + d.risco_color + ";'>" + d.risco_label + "</b><br/>" +
+            "Rajada máx.: <b style='color:" + d.cor_gust + ";'>" + d.max_gust.toFixed(0) + " km/h</b>" +
+            " · Chuva acum.: <b style='color:" + d.cor_precip + ";'>" + d.soma_precip.toFixed(1) + " mm</b>" +
+            " · CAPE máx.: <b style='color:" + d.cor_cape + ";'>" + d.max_cape.toFixed(0) + " J/kg</b>";
+        renderizarContatos(d.contatos);
+
+        if (window.Chart) {{
+            montarGrafico(d);
+        }} else {{
+            var s = document.createElement("script");
+            s.src = "https://cdn.jsdelivr.net/npm/chart.js";
+            s.onload = function() {{ montarGrafico(d); }};
+            document.head.appendChild(s);
+        }}
+    }};
+
+    function ligarMarcadores() {{
+        {marcadores_bind_str}
+    }}
+    if (document.readyState === "complete") {{ ligarMarcadores(); }}
+    else {{ window.addEventListener("load", ligarMarcadores); }}
+}})();
+</script>
+"""
+    m.get_root().html.add_child(folium.Element(painel_estacao_script))
 
     # --------------------------------------------------------------
     # Busca de unidade 100% em JS: digitar/escolher aqui só dá zoom +
@@ -995,76 +1079,6 @@ window.addEventListener("load", function() {{
 </script>
 """
     m.get_root().html.add_child(folium.Element(busca_html))
-
-    # --------------------------------------------------------------
-    # Ponte pra abrir a previsão horária de uma unidade na aba lateral,
-    # sem navegar (o iframe não tem permissão pra navegar a página
-    # principal) — em vez disso, escreve direto no campo de texto
-    # escondido "bridge_unidade_previsao" e dispara os eventos que o
-    # Streamlit espera pra reconhecer a mudança e rodar de novo.
-    # IMPORTANTE: usa window.top (não window.parent) porque o Folium
-    # já embrulha o mapa no próprio iframe interno — window.parent
-    # aqui aponta só pra esse iframe intermediário, não pra página
-    # principal do Streamlit. window.top sempre é o nível mais alto,
-    # não importa quantos iframes existam no meio.
-    # --------------------------------------------------------------
-    ponte_html = """
-<div id="ponte-debug-bar" style="display:none; position:absolute; z-index:1000; top:8px; left:50%; transform:translateX(-50%); background:rgba(15,15,20,0.85); color:#e5e7eb; padding:4px 10px; border-radius:6px; font:11px monospace;"></div>
-<script>
-function _blueoceanDebug(msg) {
-    try {
-        var el = document.getElementById("ponte-debug-bar");
-        if (el) { el.style.display = "block"; el.innerText = msg; setTimeout(function(){ el.style.display = "none"; }, 4000); }
-    } catch (e) {}
-}
-window.blueoceanAbrirPrevisao = function(estacaoKey) {
-    try {
-        _blueoceanDebug("🔎 clique recebido: " + estacaoKey);
-        var topoDoc = window.top.document;
-        var alvo = null;
-
-        // Estratégia principal: acha pela classe do container que a gente
-        // mesmo cria (não depende de como o Streamlit nomeia aria-label,
-        // que pode mudar entre versões).
-        var container = topoDoc.querySelector(".st-key-ponte_previsao");
-        if (container) alvo = container.querySelector("input");
-
-        // Fallback: procura por aria-label, caso a classe do container
-        // não seja encontrada por algum motivo.
-        if (!alvo) {
-            topoDoc.querySelectorAll('input[type="text"]').forEach(function(inp) {
-                if (inp.getAttribute("aria-label") === "bridge_unidade_previsao") alvo = inp;
-            });
-        }
-
-        if (!alvo) { _blueoceanDebug("❌ campo-ponte não encontrado (container=" + !!container + ")"); return; }
-
-        alvo.focus();
-        alvo.select();
-
-        // Tenta várias formas de "digitar" no campo, porque diferentes
-        // navegadores/versões reagem diferente ao componente React do
-        // Streamlit. Fazer todas não tem problema — são idempotentes.
-        var execOk = false;
-        try { execOk = topoDoc.execCommand("insertText", false, estacaoKey); } catch (e) {}
-
-        try {
-            var setter = Object.getOwnPropertyDescriptor(window.top.HTMLInputElement.prototype, "value").set;
-            setter.call(alvo, estacaoKey);
-            alvo.dispatchEvent(new window.top.Event("input", { bubbles: true }));
-        } catch (e) {}
-
-        try { alvo.dispatchEvent(new window.top.Event("change", { bubbles: true })); } catch (e) {}
-
-        alvo.blur();
-        _blueoceanDebug("✅ enviado (valor final: " + alvo.value + ")");
-    } catch (e) {
-        _blueoceanDebug("⚠️ erro: " + String(e));
-    }
-};
-</script>
-"""
-    m.get_root().html.add_child(folium.Element(ponte_html))
 
     # JS que atualiza SÓ os raios (pontos + células de deslocamento),
     # lendo periodicamente static/raios_live.json — o resto do mapa
@@ -1242,54 +1256,7 @@ with col_mapa:
 
 with col_lado:
     with st.container(key="painel_lateral"):
-        unidade_focada = None
-        unidade_clicada_nome = st.session_state.get("bridge_unidade_previsao", "")
-        if unidade_clicada_nome:
-            linhas_foco = df_estacoes[df_estacoes["estacao"] == unidade_clicada_nome]
-            if not linhas_foco.empty: unidade_focada = linhas_foco.iloc[0]
-
-        tab_horaria, tab_risco, tab_rank, tab_alertas, tab_raio = st.tabs(["📈 Horária", "🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios"])
-
-        with tab_horaria:
-            if unidade_focada is None:
-                st.info("👆 Clique numa unidade no mapa para ver a previsão horária do dia.")
-            else:
-                st.markdown(f"**📈 Previsão horária — {unidade_focada['nome']}**")
-                if st.button("✕ limpar seleção", key="limpar_unidade_previsao"):
-                    st.session_state["_limpar_previsao_flag"] = True
-                    st.rerun()
-                horas_full = [f"{h:02d}:00" for h in range(24)]
-                tabela_horaria = pd.DataFrame({"hora": horas_full}).set_index("hora")
-                tabela_horaria["Rajada (km/h)"] = pd.Series(dict(zip(unidade_focada["horas"], unidade_focada["gusts"])))
-                tabela_horaria["Chuva (mm)"] = pd.Series(dict(zip(unidade_focada["horas"], unidade_focada["precip"])))
-                tabela_horaria["CAPE (J/kg)"] = pd.Series(dict(zip(unidade_focada["horas"], unidade_focada["capes"])))
-                tabela_horaria = tabela_horaria.dropna(how="all")
-                if tabela_horaria.empty:
-                    st.warning("Sem dados horários pra essa unidade/dia.")
-                else:
-                    st.line_chart(tabela_horaria[["Rajada (km/h)"]], height=180)
-                    st.line_chart(tabela_horaria[["Chuva (mm)"]], height=140)
-                    st.line_chart(tabela_horaria[["CAPE (J/kg)"]], height=140)
-
-                dfs_base_comp = st.session_state.get("dfs_base")
-                if dfs_base_comp:
-                    var_comp_map = {"Rajada de vento": ("wind_gust_kmh", "km/h"), "Precipitação": ("precip_mm", "mm"), "CAPE": ("cape_jkg", "J/kg")}
-                    coluna_comp, unidade_comp = var_comp_map[variavel_mapa]
-                    st.caption(f"Comparação entre modelos — GFS · ICON · ECMWF — {variavel_mapa}")
-                    tabela_comp = pd.DataFrame({"hora": horas_full}).set_index("hora")
-                    for modelo_id, label in [("gfs_seamless", "GFS"), ("icon_seamless", "ICON"), ("ecmwf_ifs025", "ECMWF")]:
-                        d_modelo = dfs_base_comp.get(modelo_id)
-                        if d_modelo is None: continue
-                        sel = d_modelo[(d_modelo["estacao"] == unidade_focada["estacao"]) & (d_modelo["valid_time"].dt.date == pd.Timestamp(params["target_date"]).date())].copy()
-                        if sel.empty: continue
-                        sel["hora"] = sel["valid_time"].dt.strftime("%H:00")
-                        serie = sel.set_index("hora")[coluna_comp]
-                        if coluna_comp == "wind_gust_kmh": serie = serie * (1 + params["margin_pct"] / 100)
-                        tabela_comp[label] = serie
-                    tabela_comp = tabela_comp.dropna(how="all")
-                    if not tabela_comp.empty:
-                        st.line_chart(tabela_comp, height=220)
-                        st.caption(f"Valores em {unidade_comp}. Quanto mais os modelos concordam, maior a confiança.")
+        tab_risco, tab_rank, tab_alertas, tab_raio = st.tabs(["🚨 Risco", "🏆 Ranking", "📋 Alertas", "⚡ Raios"])
 
         with tab_risco:
             em_risco = df_estacoes[df_estacoes["risco_score"] > 0].sort_values("risco_score", ascending=False)
