@@ -344,7 +344,12 @@ def fetch_openmeteo_full_hourly(df_json, model, target_date, batch_size=40):
     df = pd.read_json(io.StringIO(df_json))
     session = build_session()
     url, api_key = _openmeteo_base_url()
-    today = pd.Timestamp.now("UTC").tz_localize(None).normalize()
+    # "hoje" tem que ser calculado no fuso de Brasília, não em UTC — perto
+    # da virada do dia (21h-00h em Brasília = já é "amanhã" em UTC) isso
+    # fazia o cálculo de past_days/forecast_days errar por 1 dia e a busca
+    # pro dia seguinte podia vir vazia.
+    today = utc_para_brasilia(datetime.now(timezone.utc)).replace(hour=0, minute=0, second=0, microsecond=0)
+    today = pd.Timestamp(today).tz_localize(None).normalize()
     target = pd.Timestamp(target_date).normalize()
     diff_days = (today - target).days
     if diff_days >= 0:
@@ -712,7 +717,12 @@ with st.sidebar:
                 st.success(f"Usando {len(df_stations)} estações da planilha enviada.")
 
     st.subheader("📅 Data e horários")
-    target_date = st.date_input("Data da previsão", value=datetime.now().date())
+    hoje_brasilia = utc_para_brasilia(datetime.now(timezone.utc)).date()
+    target_date = st.date_input(
+        "Data da previsão", value=hoje_brasilia,
+        min_value=hoje_brasilia - timedelta(days=90), max_value=hoje_brasilia + timedelta(days=15),
+        help="O Open-Meteo cobre até 90 dias no passado (histórico) e 15 dias de previsão pra frente.",
+    )
     todas_horas = [f"{h:02d}" for h in range(24)]
     horas_selecionadas = st.multiselect("Horários a incluir", todas_horas, default=todas_horas)
 
@@ -729,12 +739,13 @@ with st.sidebar:
     incluir_raios = st.checkbox("Mostrar raios ao vivo no mapa", value=True)
     raios_minutos = st.slider("Janela de tempo (min)", 5, 60, 15, step=5, disabled=not incluir_raios)
     intervalo_raios_seg = st.slider("Intervalo de atualização dos raios (segundos)", 10, 120, 30, step=10, disabled=not incluir_raios)
-    tocar_som = st.checkbox("Tocar som e abrir pop-up quando raio cair no range de perigo de uma unidade", value=True, disabled=not incluir_raios)
+    tocar_som = True
+    st.caption("🔊 O som e o pop-up automático de alerta ficam sempre ativos quando os raios estão ligados.")
     mostrar_deslocamento = st.checkbox("Mostrar deslocamento das células de tempestade", value=True, disabled=not incluir_raios)
     st.caption("🔄 Só os raios (pontos, células e alertas) atualizam sozinhos — o mapa em si (zoom, posição, pop-ups abertos) não é recarregado.")
 
     st.subheader("📏 Raios de alerta ao redor das unidades")
-    mostrar_aneis = st.checkbox("Mostrar anéis de distância no mapa", value=False)
+    mostrar_aneis = st.checkbox("Mostrar anéis de distância no mapa", value=True)
     distancias_aneis = st.multiselect("Distâncias (km)", [30, 50, 100, 150, 200], default=[30, 50, 100, 150, 200], disabled=not mostrar_aneis)
 
     st.subheader("🗺️ Variável e horário no mapa")
@@ -750,29 +761,40 @@ margin = 1.5
 bbox = {"lon_min": df_stations["lon"].min() - margin, "lon_max": df_stations["lon"].max() + margin, "lat_min": df_stations["lat"].min() - margin, "lat_max": df_stations["lat"].max() + margin}
 
 if gerar:
-    with st.spinner("Buscando dados no Open-Meteo..."):
-        modelos_necessarios = set(ENSEMBLE_MODELOS) | {m for m in (modelo_vento, modelo_chuva, modelo_cape) if m != "ensemble"}
-        df_json = df_stations.to_json()
-        dfs_base = {}
-        for i, m in enumerate(sorted(modelos_necessarios)):
-            if i > 0: time.sleep(2.0)
-            dfs_base[m] = fetch_openmeteo_full_hourly(df_json, m, str(target_date))
+    try:
+        with st.spinner("Buscando dados no Open-Meteo..."):
+            modelos_necessarios = set(ENSEMBLE_MODELOS) | {m for m in (modelo_vento, modelo_chuva, modelo_cape) if m != "ensemble"}
+            df_json = df_stations.to_json()
+            dfs_base = {}
+            for i, m in enumerate(sorted(modelos_necessarios)):
+                if i > 0: time.sleep(2.0)
+                dfs_base[m] = fetch_openmeteo_full_hourly(df_json, m, str(target_date))
 
-        def obter(modelo_id): return compute_ensemble([dfs_base[m] for m in ENSEMBLE_MODELOS]) if modelo_id == "ensemble" else dfs_base[modelo_id]
+            def obter(modelo_id): return compute_ensemble([dfs_base[m] for m in ENSEMBLE_MODELOS]) if modelo_id == "ensemble" else dfs_base[modelo_id]
 
-        df_vento_src, df_chuva_src, df_cape_src = obter(modelo_vento), obter(modelo_chuva), obter(modelo_cape)
-        chave = ["estacao", "lat", "lon", "valid_time"]
-        df_final = df_vento_src[chave + ["wind_gust_kmh", "wind_speed_kmh", "wind_dir_deg"]].copy()
-        df_final = df_final.merge(df_chuva_src[chave + ["precip_mm"]], on=chave, how="left")
-        df_final = df_final.merge(df_cape_src[chave + ["cape_jkg"]], on=chave, how="left")
+            df_vento_src, df_chuva_src, df_cape_src = obter(modelo_vento), obter(modelo_chuva), obter(modelo_cape)
+            chave = ["estacao", "lat", "lon", "valid_time"]
+            df_final = df_vento_src[chave + ["wind_gust_kmh", "wind_speed_kmh", "wind_dir_deg"]].copy()
+            df_final = df_final.merge(df_chuva_src[chave + ["precip_mm"]], on=chave, how="left")
+            df_final = df_final.merge(df_cape_src[chave + ["cape_jkg"]], on=chave, how="left")
 
-        label_v, label_c, label_cp = MODEL_LABELS[modelo_vento], MODEL_LABELS[modelo_chuva], MODEL_LABELS[modelo_cape]
-        modelo_label = label_v if modelo_vento == modelo_chuva == modelo_cape else f"{label_v} (vento)/{label_c} (chuva)/{label_cp} (CAPE)"
+            if df_final.empty or df_final["valid_time"].dt.date.eq(target_date).sum() == 0:
+                st.warning(
+                    f"O Open-Meteo respondeu, mas não veio nenhum horário pra **{target_date.strftime('%d/%m/%Y')}** "
+                    "nos dados recebidos. Isso pode acontecer se a data escolhida estiver fora da janela de "
+                    "cobertura do modelo — tente uma data mais próxima de hoje."
+                )
 
-        st.session_state.df_full = df_final
-        st.session_state.modelo_label = modelo_label
-        st.session_state.dfs_base = {m: dfs_base[m] for m in ENSEMBLE_MODELOS if m in dfs_base}
-        st.session_state.params = dict(target_date=str(target_date), horas=horas_selecionadas, margin_pct=margin_pct, alerta_gust_min=alerta_gust_min, alerta_cape_min=alerta_cape_min, meteorologista=meteorologista)
+            label_v, label_c, label_cp = MODEL_LABELS[modelo_vento], MODEL_LABELS[modelo_chuva], MODEL_LABELS[modelo_cape]
+            modelo_label = label_v if modelo_vento == modelo_chuva == modelo_cape else f"{label_v} (vento)/{label_c} (chuva)/{label_cp} (CAPE)"
+
+            st.session_state.df_full = df_final
+            st.session_state.modelo_label = modelo_label
+            st.session_state.dfs_base = {m: dfs_base[m] for m in ENSEMBLE_MODELOS if m in dfs_base}
+            st.session_state.params = dict(target_date=str(target_date), horas=horas_selecionadas, margin_pct=margin_pct, alerta_gust_min=alerta_gust_min, alerta_cape_min=alerta_cape_min, meteorologista=meteorologista)
+    except Exception as e:
+        st.error(f"Não consegui buscar os dados do Open-Meteo pra **{target_date.strftime('%d/%m/%Y')}**: {e}")
+        st.stop()
 
 if "df_full" not in st.session_state:
     st.info("Configure os parâmetros na barra lateral e clique em **Gerar / Atualizar mapa**.")
@@ -1105,7 +1127,6 @@ window.addEventListener("load", function() {{
   ⚡ carregando raios…
   <button id="raios-som-btn" style="margin-left:8px; font:11px sans-serif; cursor:pointer; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:4px; padding:1px 6px;">🔊 ativar som</button>
 </div>
-<div id="alertas-unidade-box" style="display:none; position:absolute; z-index:1000; top:44px; left:50px; max-width:260px;"></div>
 <style>
 .raio-celula-icon {{ background: transparent !important; border: none !important; }}
 </style>
@@ -1122,7 +1143,6 @@ window.addEventListener("load", function() {{
     var somLiberado = false;
     var vistosNotificacao = {{}};
     var statusEl = document.getElementById("raios-status-bar");
-    var alertasBox = document.getElementById("alertas-unidade-box");
     var btnSom = document.getElementById("raios-som-btn");
     if (btnSom) {{
         btnSom.onclick = function() {{
@@ -1161,21 +1181,6 @@ window.addEventListener("load", function() {{
                 audio.play().catch(function() {{}});
             }}
         }});
-    }}
-
-    function desenharAlertas(alertas) {{
-        if (!alertasBox) return;
-        if (!alertas || !alertas.length) {{ alertasBox.innerHTML = ""; alertasBox.style.display = "none"; return; }}
-        alertasBox.style.display = "block";
-        var ordem = {{"vermelho": 0, "amarelo": 1}};
-        var lista = alertas.slice().sort(function(a, b) {{ return (ordem[a.nivel] ?? 2) - (ordem[b.nivel] ?? 2); }});
-        alertasBox.innerHTML = lista.map(function(a) {{
-            var cor = a.nivel === "vermelho" ? "#ef4444" : "#eab308";
-            var textoCor = a.nivel === "vermelho" ? "#fff" : "#111827";
-            var rotulo = a.nivel === "vermelho" ? "🔴 VERMELHO · raio a <30km" : "🟡 AMARELO · raio a <50km";
-            return '<div style="background:' + cor + '; color:' + textoCor + '; padding:4px 8px; border-radius:5px; margin-bottom:4px; font:11px sans-serif;">' +
-                '<b>' + a.estacao + '</b><br/>' + rotulo + ' · ativo até ' + a.expira_brasilia + '</div>';
-        }}).join("");
     }}
 
     function desenharRaios(data) {{
@@ -1223,7 +1228,6 @@ window.addEventListener("load", function() {{
             .then(function(r) {{ return r.json(); }})
             .then(function(data) {{
                 desenharRaios(data);
-                desenharAlertas(data.alertas || []);
                 checarPerigo(data.alertas || []);
                 if (statusEl) {{
                     var txt = data.erro ? ("⚠️ GLM indisponível: " + data.erro) : ("⚡ raios atualizados às " + (data.atualizado_em_brasilia || "—"));
