@@ -820,9 +820,6 @@ def _dialog_alerta_raio():
     if not texto: return
     st.warning("Foi detectado um raio próximo de uma unidade monitorada. Copie a mensagem abaixo:")
     st.code(texto, language=None)
-    if st.button("Fechar", use_container_width=True, type="primary"):
-        st.session_state.dialog_raio_texto = None
-        st.rerun()
 
 def _atualizar_dados_raios():
     """Só busca os raios, agrupa em células, checa proximidade de perigo
@@ -878,6 +875,7 @@ def _atualizar_dados_raios():
                     texto = montar_mensagem_proximidade_raio(nivel_km, est["nome"], params["meteorologista"], renovacao=renovacao)
                     st.session_state.alertas_raio_ativos.insert(0, {"texto": texto, "estacao": est["nome"], "expira": agora_ts + 3600})
                     st.session_state.dialog_raio_texto = texto
+                    st.session_state.dialog_raio_ts = agora_ts
 
     st.session_state.alertas_raio_ativos = [a for a in st.session_state.alertas_raio_ativos if a["expira"] > time.time()]
     st.session_state["_fragment_raios_df"] = raios_df
@@ -885,7 +883,13 @@ def _atualizar_dados_raios():
 
     _escrever_raios_json(raios_df, celulas_com_trajetoria, st.session_state.get("ultima_atualizacao_raios"), st.session_state.alertas_unidade, erro, intervalo_raios_seg)
 
-    if st.session_state.get("dialog_raio_texto"): _dialog_alerta_raio()
+    # Só chama o diálogo numa janela curtinha logo após um alerta NOVO —
+    # senão ele reabriria sozinho a cada atualização de raios, mesmo
+    # depois de já ter sido fechado no X.
+    dialog_ts = st.session_state.get("dialog_raio_ts")
+    janela_dialog_seg = max(intervalo_raios_seg * 1.5, 20)
+    if dialog_ts and (time.time() - dialog_ts) < janela_dialog_seg and st.session_state.get("dialog_raio_texto"):
+        _dialog_alerta_raio()
 
     if incluir_raios:
         ultima_att = st.session_state.get("ultima_atualizacao_raios")
