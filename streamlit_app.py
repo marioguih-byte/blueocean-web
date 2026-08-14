@@ -1151,7 +1151,6 @@ window.addEventListener("load", function() {{
         script_html = f"""
 <div id="raios-status-bar" style="position:absolute; z-index:1000; top:8px; left:50px; background:rgba(15,15,20,0.75); color:#e5e7eb; padding:4px 10px; border-radius:6px; font:12px sans-serif;">
   ⚡ carregando raios…
-  <button id="raios-som-btn" style="margin-left:8px; font:11px sans-serif; cursor:pointer; background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:4px; padding:1px 6px;">🔊 ativar som</button>
 </div>
 <style>
 .raio-celula-icon {{ background: transparent !important; border: none !important; }}
@@ -1166,15 +1165,26 @@ window.addEventListener("load", function() {{
     var celulasLayer = L.layerGroup().addTo(map);
     var audio = new Audio(cfg.somUrl);
     audio.preload = "auto";
-    var somLiberado = false;
     var vistosNotificacao = {{}};
     var statusEl = document.getElementById("raios-status-bar");
-    var btnSom = document.getElementById("raios-som-btn");
-    if (btnSom) {{
-        btnSom.onclick = function() {{
-            audio.play().then(function() {{ audio.pause(); audio.currentTime = 0; somLiberado = true; btnSom.innerText = "🔊 som ativado"; }}).catch(function() {{}});
-        }};
+
+    // O navegador só libera áudio automático depois de alguma interação
+    // do usuário com a página — sem botão visível, aproveita a PRIMEIRA
+    // interação (clique/tecla em qualquer lugar) pra destravar o som,
+    // silenciosamente, só uma vez.
+    function destravarSom() {{
+        audio.play().then(function() {{ audio.pause(); audio.currentTime = 0; }}).catch(function() {{}});
+        document.removeEventListener("click", destravarSom, true);
+        document.removeEventListener("keydown", destravarSom, true);
+        window.top.document.removeEventListener("click", destravarSom, true);
+        window.top.document.removeEventListener("keydown", destravarSom, true);
     }}
+    document.addEventListener("click", destravarSom, true);
+    document.addEventListener("keydown", destravarSom, true);
+    try {{
+        window.top.document.addEventListener("click", destravarSom, true);
+        window.top.document.addEventListener("keydown", destravarSom, true);
+    }} catch (e) {{}}
 
     function corPorIdade(idadeMin) {{
         var fracao = Math.min(idadeMin / Math.max(cfg.janelaMin, 1), 1);
@@ -1318,6 +1328,7 @@ with col_lado:
                 if st.session_state.alertas_raio_ativos:
                     if st.button("🗑️ Limpar todos os alertas", key="limpar_todos_alertas", use_container_width=True):
                         st.session_state.alertas_raio_ativos = []
+                        st.rerun(scope="fragment")
                     for a in st.session_state.alertas_raio_ativos:
                         with st.container(border=True):
                             col_txt, col_del = st.columns([6, 1])
@@ -1327,6 +1338,7 @@ with col_lado:
                             with col_del:
                                 if st.button("✕", key=f"excluir_alerta_{a.get('id', a['texto'])}", help="Excluir este alerta"):
                                     st.session_state.alertas_raio_ativos = [x for x in st.session_state.alertas_raio_ativos if x.get("id") != a.get("id")]
+                                    st.rerun(scope="fragment")
                 else:
                     st.info("Nenhum alerta de raio próximo ativo.")
 
